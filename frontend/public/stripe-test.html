@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Stripe Test</title>
+</head>
+<body>
+  <h2>Probar Stripe Checkout</h2>
+
+  <button id="pay">Pagar $19.99</button>
+
+  <script>
+    document.getElementById("pay").onclick = async () => {
+      const res = await fetch("http://localhost:5177/stripe/create-checkout-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orderId: "TEST123",
+          amountCents: 1999
+        })
+      });
+
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        alert("Error creando sesión Stripe");
+      }
+    };
+  </script>
+</body>
+</html>
