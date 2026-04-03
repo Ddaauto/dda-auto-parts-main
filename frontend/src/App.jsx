@@ -30,7 +30,6 @@ const US_STATES = [
   "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
 ];
 
-
 function norm(s) {
   return String(s || "").trim().toLowerCase();
 }
