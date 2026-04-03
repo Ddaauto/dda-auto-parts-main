@@ -4,7 +4,7 @@ import Register from "./Register";
 import "./App.css";
 import logo from "./assets/logo.jpg";
 import Success from "./Success";
-import Cancel from "./Cancel";
+import Cancel from "./NewCancel";
 /**
  * =========================
  * CONFIG
