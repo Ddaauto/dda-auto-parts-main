@@ -3,5 +3,6 @@ server/.env
 frontend/.env
 .env
 *.sqlite
+!server/dda.sqlite
 server/invoices/
 server/uploads/
