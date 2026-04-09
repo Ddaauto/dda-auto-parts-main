@@ -220,7 +220,7 @@ const [pickQty, setPickQty] = useState(1);
       setProducts([]);
     }
   })();
-}, []);
+}, [adminTab]);
  useEffect(() => {
   const email = String(coEmail || "").trim();
   if (!email || !coItems || coItems.length === 0) {
