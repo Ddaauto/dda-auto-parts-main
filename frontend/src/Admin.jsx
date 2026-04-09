@@ -198,7 +198,7 @@ const [pickQty, setPickQty] = useState(1);
       const token = localStorage.getItem("token");
       if (!token) return setProducts([]);
 
-      const r = await fetch("http://localhost:5177/admin/products", {
+      const r = await fetch(`${API_BASE}/admin/products`, {
         headers: { Authorization: "Bearer " + token },
       });
 
@@ -276,7 +276,7 @@ const [pickQty, setPickQty] = useState(1);
     // SKU temporal único (SQLite requiere sku + name)
     const tempSku = "NEW-" + Date.now();
 
-    const r = await fetch("http://localhost:5177/admin/products", {
+    const r = await fetch(`${API_BASE}/admin/products`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -296,7 +296,7 @@ const [pickQty, setPickQty] = useState(1);
     if (!r.ok) return alert(out?.error || "Failed to create product");
 
     // Recargar lista desde SQLite
-    const r2 = await fetch("http://localhost:5177/admin/products", {
+    const r2 = await fetch(`${API_BASE}/admin/products`, {
       headers: { Authorization: "Bearer " + token },
     });
 
@@ -328,7 +328,7 @@ const normalized = arr.map((p) => ({
     const token = localStorage.getItem("token");
     if (!token) return;
 
-    const r = await fetch(`http://localhost:5177/admin/products/${id}`, {
+    const r = await fetch(`https://dda-backend-ajr3.onrender.com/admin/products/${id}`, {
       method: "DELETE",
       headers: {
         Authorization: "Bearer " + token,
@@ -382,7 +382,7 @@ setDirtyProducts((prev) => ({
   ...prev,
   [p.id]: false,
 }));
-    const r = await fetch(`http://localhost:5177/admin/products/${p.id}`, {
+    const r = await fetch(`https://dda-backend-ajr3.onrender.com/admin/products/${p.id}`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -990,7 +990,7 @@ const validateProduct = (p) => {
         const token = localStorage.getItem("token");
         if (!token) return;
 
-        const r = await fetch("http://localhost:5177/admin/products/import", {
+       const r = await fetch(`${API_BASE}/admin/products/import`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
