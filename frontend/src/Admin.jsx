@@ -1907,11 +1907,7 @@ if (stock <= 0) return alert(`OUT OF STOCK: ${sku}`);
   <>
     {(() => {
       const filteredProducts = (products || []).filter((p) => {
-       console.log("products:", products);
-console.log("filteredProducts:", filteredProducts);
-console.log("productCategoryFilter:", productCategoryFilter);
-console.log("productStatusFilter:", productStatusFilter);
-console.log("productLowStockOnly:", productLowStockOnly); 
+       
         const q = String(productSearch || "").trim().toLowerCase();
 
         const matchesSearch =
