@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import fitmentData from "./data/fitment.json";
 import AdminZellePending from "./AdminZellePending";
-
+const API_BASE = "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
 // VITE_ADMIN_USER=admin
 // VITE_ADMIN_PASS=1234
