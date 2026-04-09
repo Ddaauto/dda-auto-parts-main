@@ -1918,15 +1918,17 @@ if (stock <= 0) return alert(`OUT OF STOCK: ${sku}`);
           String(p.category || "").toLowerCase().includes(q);
 
         const matchesCategory =
-          !productCategoryFilter || String(p.category || "") === productCategoryFilter;
+  !productCategoryFilter ||
+  productCategoryFilter === "All categories" ||
+  String(p.category || "") === productCategoryFilter;
 
         const matchesStatus =
-          productStatusFilter === "all"
-            ? true
-            : productStatusFilter === "active"
-            ? p.active !== false
-            : p.active === false;
-
+  productStatusFilter === "all" ||
+  productStatusFilter === "All status"
+    ? true
+    : productStatusFilter === "active"
+    ? p.active !== false
+    : p.active === false;
         const stockNum = safeNum(p.stock ?? 0);
         const matchesLowStock = !productLowStockOnly || stockNum <= 1;
 
