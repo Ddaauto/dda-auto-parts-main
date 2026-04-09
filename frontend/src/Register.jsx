@@ -41,25 +41,26 @@ export default function Register({ onRegistered }) {
     }
 
     try {
-      setLoading(true);
-      const r = await fetch("http://localhost:5177/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
-      });
+  setLoading(true);
 
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Register failed");
+  const r = await fetch("https://dda-backend-ajr3.onrender.com/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(form),
+  });
 
-      // guardar token
-      localStorage.setItem("token", data.token);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "Register failed");
 
-      onRegistered?.(data);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
+  // guardar token
+  localStorage.setItem("token", data.token);
+
+  onRegistered?.(data);
+} catch (e) {
+  setError(e.message);
+} finally {
+  setLoading(false);
+}
   };
 
   return (
