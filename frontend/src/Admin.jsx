@@ -1917,14 +1917,12 @@ if (stock <= 0) return alert(`OUT OF STOCK: ${sku}`);
           String(p.mpn || "").toLowerCase().includes(q) ||
           String(p.category || "").toLowerCase().includes(q);
 
-        const matchesCategory =
+     const matchesCategory =
   !productCategoryFilter ||
-  productCategoryFilter === "All categories" ||
   String(p.category || "") === productCategoryFilter;
 
         const matchesStatus =
-  productStatusFilter === "all" ||
-  productStatusFilter === "All status"
+  productStatusFilter === "all"
     ? true
     : productStatusFilter === "active"
     ? p.active !== false
