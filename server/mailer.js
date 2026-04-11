@@ -7,14 +7,20 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM_EMAIL = process.env.FROM_EMAIL || "no-reply@ddaautoparts.com";
 const FROM_NAME = process.env.FROM_NAME || "DDA Auto Parts";
 
-export async function sendEmail({ to, subject, html, text }) {
-  await resend.emails.send({
+export async function sendEmail({ to, subject, html, text, attachments = [] }) {
+  const msg = {
     from: `${FROM_NAME} <${FROM_EMAIL}>`,
     to,
     subject,
     html: html || `<p>${text}</p>`,
     text,
-  });
+  };
+
+  if (attachments && attachments.length) {
+    msg.attachments = attachments;
+  }
+
+  await resend.emails.send(msg);
 }
 
 export async function sendAdminZellePendingEmail(order) {
