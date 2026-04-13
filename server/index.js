@@ -2512,7 +2512,7 @@ logOrderEvent(
   req.user?.id ? String(req.user.id) : null
 );
 // === Admin email: Zelle pendiente (solo 1 vez) ===
-if (pm2 === "zelle") {
+if (String(pm2).toLowerCase() === "zelle")
   try {
     const row = db
       .prepare(`SELECT id, orderNumber, orderSeq, grandTotal, customerSnapshot, zelleNotifiedAt

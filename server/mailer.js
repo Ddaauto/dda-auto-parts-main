@@ -29,7 +29,7 @@ export async function sendAdminZellePendingEmail(order) {
 
   const orderLabel = `${order.orderNumber}${order.orderSeq ? "-" + order.orderSeq : ""}`;
 
-  const subject = `🟡 Zelle Pending — Order ${orderLabel}`;
+  const subject = `Zelle Pending ${orderLabel}`;
 
   const text =
 `Tienes un pago Zelle pendiente por confirmar.
@@ -38,7 +38,7 @@ Order: ${orderLabel}
 Customer: ${order.customerEmail || "N/A"}
 Total: $${Number(order.grandTotal || 0).toFixed(2)}
 
-Entra al Admin → Zelle Pending para confirmarla.`;
+Entra al Admin para confirmarla.`;
 
   await sendEmail({
     to,
