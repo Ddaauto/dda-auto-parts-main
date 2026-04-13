@@ -2526,20 +2526,16 @@ if (pm2 === "zelle") {
         customerEmail = snap.email || snap.customerEmail || "N/A";
       } catch {}
 
-      sendAdminZellePendingEmail({
+      await sendAdminZellePendingEmail({
         orderNumber: row.orderNumber,
         orderSeq: row.orderSeq,
         customerEmail,
         grandTotal: row.grandTotal,
-      })
-        .then(() => {
-          db.prepare(
-            `UPDATE orders SET zelleNotifiedAt = datetime('now') WHERE id = ?`
-          ).run(orderId);
-        })
-        .catch((e) => {
-          console.log("Admin Zelle pending email failed:", e.message);
-        });
+      });
+
+      db.prepare(
+        `UPDATE orders SET zelleNotifiedAt = datetime('now') WHERE id = ?`
+      ).run(orderId);
     }
   } catch (e) {
     console.log("Admin Zelle pending email failed:", e.message);
