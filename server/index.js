@@ -2526,7 +2526,7 @@ if (pm2 === "zelle") {
         customerEmail = snap.email || snap.customerEmail || "N/A";
       } catch {}
 
-      await sendAdminZellePendingEmail({
+      sendAdminZellePendingEmail({
         orderNumber: row.orderNumber,
         orderSeq: row.orderSeq,
         customerEmail,
