@@ -2525,7 +2525,7 @@ if (pm2 === "zelle") {
         const snap = JSON.parse(row.customerSnapshot || "{}");
         customerEmail = snap.email || snap.customerEmail || "N/A";
       } catch {}
-
+console.log("ZELLE ADMIN EMAIL TRIGGER");
       sendAdminZellePendingEmail({
         orderNumber: row.orderNumber,
         orderSeq: row.orderSeq,
