@@ -27,10 +27,17 @@ export default function createQuotesRouter(db, authRequired) {
       total REAL NOT NULL DEFAULT 0,
       notes TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'DRAFT',
+      expiresAt TEXT,
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     )
   `);
+
+const quoteColumns = db.prepare("PRAGMA table_info(quotes)").all();
+
+if (!quoteColumns.some((column) => column.name === "expiresAt")) {
+  db.exec("ALTER TABLE quotes ADD COLUMN expiresAt TEXT");
+}
 
   function calculate(body) {
     const items = body.items;
@@ -107,14 +114,19 @@ export default function createQuotesRouter(db, authRequired) {
       const totals = calculate(req.body);
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
+      
+const expiresDate = new Date();
+expiresDate.setUTCDate(expiresDate.getUTCDate() + 30);
+const expiresAt = expiresDate.toISOString();
+
       const quoteNumber = `QT-${Date.now()}-${id.slice(0, 6)}`;
 
       db.prepare(`
         INSERT INTO quotes (
           id, quoteNumber, customerName, customerEmail,
           itemsJson, subtotal, tax, shipping, total,
-          notes, status, createdAt, updatedAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          notes, status, expiresAt, createdAt, updatedAt
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         quoteNumber,
@@ -127,8 +139,9 @@ export default function createQuotesRouter(db, authRequired) {
         totals.total,
         String(req.body.notes || ""),
         "DRAFT",
-        now,
-        now
+expiresAt,
+now,
+now
       );
 
       res.status(201).json({
