@@ -1,6 +1,9 @@
 
 import { Router } from "express";
 import crypto from "crypto";
+import { sendEmail } from "../mailer.js";
+import PDFDocument from "pdfkit";
+
 // Secure customer quote approval links
 export default function createQuotesRouter(db, authRequired) {
   const router = Router();
@@ -36,7 +39,91 @@ if (!quoteColumns.some((column) => column.name === "expiresAt")) {
 if (!quoteColumns.some((column) => column.name === "approvalTokenHash")) {
   db.exec("ALTER TABLE quotes ADD COLUMN approvalTokenHash TEXT");
 }
+function generateQuotePDF(quote) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+    const chunks = [];
 
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+   doc.fontSize(20).text("DDA AUTO PARTS", { align: "center" });
+doc.moveDown();
+
+doc.fontSize(16).text("QUOTATION", { align: "center" });
+doc.moveDown();
+
+doc.fontSize(11);
+doc.text(`Quote Number: ${quote.quoteNumber}`);
+doc.text(`Customer: ${quote.customerName}`);
+doc.text(`Date: ${new Date(quote.createdAt).toLocaleDateString("en-US")}`);
+doc.text(`Valid Until: ${new Date(quote.expiresAt).toLocaleDateString("en-US")}`);
+
+doc.moveDown();
+ doc.fontSize(12).text("PRODUCTS", { underline: true });
+doc.moveDown(0.5);
+
+const items = JSON.parse(quote.itemsJson);
+
+items.forEach((item, index) => {
+  const lineTotal = Number(item.qty) * Number(item.price);
+
+  doc.fontSize(10).text(
+    `${index + 1}. ${item.name} | Qty: ${item.qty} | Unit: $${Number(item.price).toFixed(2)} | Total: $${lineTotal.toFixed(2)}`
+  );
+  doc.moveDown(0.5);
+});
+doc.moveDown();
+
+doc.fontSize(11).text(`Subtotal: $${Number(quote.subtotal).toFixed(2)}`, { align: "right" });
+doc.text(`Tax: $${Number(quote.tax).toFixed(2)}`, { align: "right" });
+doc.text(`Shipping: $${Number(quote.shipping).toFixed(2)}`, { align: "right" });
+
+doc.moveDown(0.5);
+doc.fontSize(14).text(`TOTAL: $${Number(quote.total).toFixed(2)}`, {
+  align: "right"
+});
+if (quote.notes) {
+  doc.moveDown();
+  doc.fontSize(11).text("NOTES:", { underline: true });
+  doc.fontSize(10).text(String(quote.notes));
+}    
+doc.end(); 
+  });
+}
+ async function sendQuoteEmail(quote, approvalToken) {
+  const pdfBuffer = await generateQuotePDF(quote);
+
+  const quoteLink =
+    `${process.env.FRONTEND_URL}/quote/${approvalToken}`;
+
+  await sendEmail({
+    to: quote.customerEmail,
+    subject: `DDA Auto Parts - Quotation ${quote.quoteNumber}`,
+    html: `
+      <h2>DDA Auto Parts</h2>
+      <p>Hello ${quote.customerName},</p>
+      <p>Please find your quotation attached.</p>
+      <p><strong>Quote:</strong> ${quote.quoteNumber}</p>
+      <p><strong>Total:</strong> $${Number(quote.total).toFixed(2)}</p>
+      <p><strong>Valid until:</strong>
+        ${new Date(quote.expiresAt).toLocaleDateString("en-US")}
+      </p>
+      <p>
+        <a href="${quoteLink}">
+          Review, Accept or Reject Your Quotation
+        </a>
+      </p>
+      <p>Thank you for choosing DDA Auto Parts.</p>
+    `,
+    attachments: [
+      {
+        filename: `${quote.quoteNumber}.pdf`,
+        content: pdfBuffer
+      }
+    ]
+  });
+} 
   function calculate(body) {
     const items = body.items;
 
@@ -247,7 +334,80 @@ approvalToken
       res.status(400).json({ error: err.message });
     }
   });
+// ADMIN: SEND QUOTE TO CUSTOMER BY EMAIL
+  router.post("/:id/send", async (req, res) => {
+  try {
+    const quote = db.prepare(
+      "SELECT * FROM quotes WHERE id = ?"
+    ).get(req.params.id);
 
+    if (!quote) {
+      return res.status(404).json({ error: "Quote not found" });
+    }
+
+    if (quote.status !== "DRAFT") {
+      return res.status(409).json({
+        error: "Only draft quotes can be sent"
+      });
+    }
+
+    if (!quote.customerEmail?.trim()) {
+      return res.status(400).json({
+        error: "Customer email is required"
+      });
+    }
+
+    if (!process.env.FRONTEND_URL) {
+      return res.status(500).json({
+        error: "FRONTEND_URL is not configured"
+      });
+    }
+
+    const approvalToken = crypto.randomBytes(32).toString("hex");
+    const approvalTokenHash = crypto
+      .createHash("sha256")
+      .update(approvalToken)
+      .digest("hex");
+
+    const quoteForEmail = { ...quote };
+
+
+    const result = db.prepare(`
+      UPDATE quotes
+      SET status = 'SENT',
+          approvalTokenHash = ?,
+          updatedAt = ?
+      WHERE id = ? AND status = 'DRAFT'
+    `).run(approvalTokenHash, new Date().toISOString(), quote.id);
+
+    if (result.changes !== 1) {
+      return res.status(409).json({
+        error: "Quote status changed during sending"
+      });
+    }
+try {
+  await sendQuoteEmail(quoteForEmail, approvalToken);
+} catch (emailError) {
+  db.prepare(`
+    UPDATE quotes
+    SET status = 'DRAFT',
+        approvalTokenHash = NULL,
+        updatedAt = ?
+    WHERE id = ? AND status = 'SENT'
+      AND approvalTokenHash = ?
+  `).run(new Date().toISOString(), quote.id, approvalTokenHash);
+
+  throw emailError;
+}
+    console.log(`Quotation ${quote.quoteNumber} email sent successfully`);
+    res.json({ ok: true, status: "SENT" });
+  } catch (err) {
+    console.error("Quote email error:", err);
+    res.status(500).json({
+      error: "Unable to send quotation"
+    });
+  }
+});
   router.patch("/:id", (req, res) => {
     try {
       const existing = db.prepare(
