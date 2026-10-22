@@ -12,7 +12,7 @@ import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
 import stripeRoutes from "./routes/stripe.js";
-
+import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
 
@@ -963,7 +963,7 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
-
+app.use("/api/quotes", createQuotesRouter(db, authRequired));
 // =====================================================
 // SHIPPING (Uber + Free Delivery) + TAX
 // =====================================================
