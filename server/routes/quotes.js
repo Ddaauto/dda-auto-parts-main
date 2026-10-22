@@ -244,6 +244,38 @@ doc.end();
   }
 
   res.json({ ok: true, status: decision });
+ 
+
+const quote = db.prepare(`
+  SELECT quoteNumber, customerName, customerEmail, total
+  FROM quotes
+  WHERE approvalTokenHash = ?
+`).get(tokenHash);
+
+const adminEmail = process.env.ADMIN_NOTIFY_EMAIL;
+
+if (quote && adminEmail) {
+  const action = decision === "ACCEPTED" ? "ACCEPTED" : "REJECTED";
+
+  sendEmail({
+    to: adminEmail,
+    subject: `Quotation ${quote.quoteNumber} - ${action}`,
+    text: `
+DDA Auto Parts - Quotation Update
+
+Quote: ${quote.quoteNumber}
+Customer: ${quote.customerName}
+Email: ${quote.customerEmail}
+Total: $${Number(quote.total).toFixed(2)}
+
+Customer decision: ${action}
+
+Log in to ADMIN to review this quotation.
+    `,
+  }).catch((err) => {
+    console.error("Quote admin notification error:", err);
+  });
+}  
 });
  router.use(authRequired);
 
