@@ -1716,6 +1716,7 @@ alert("CSV imported successfully");
           <th>Total</th>
           <th>Status</th>
           <th>Date</th>
+         <th>Actions</th> 
         </tr>
       </thead>
       <tbody>
@@ -1727,6 +1728,42 @@ alert("CSV imported successfully");
             <td>${Number(q.total || 0).toFixed(2)}</td>
             <td>{q.status}</td>
             <td>{q.createdAt?.slice(0, 10)}</td>
+            <td>
+  {q.status === "DRAFT" && (
+    <button
+      type="button"
+      className="btn btnPrimary"
+      onClick={async () => {
+        if (!window.confirm(`Send quote ${q.quoteNumber} to ${q.customerEmail}?`)) return;
+
+        try {
+          const token = localStorage.getItem("token") || "";
+          const res = await fetch(
+           `${API}/quotes/${q.id}/send`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            }
+          );
+
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || "Failed to send quote");
+          }
+
+          alert("Quote sent successfully!");
+          window.location.reload();
+        } catch (err) {
+          alert(err.message || "Error sending quote");
+        }
+      }}
+    >
+      Send Quote
+    </button>
+  )}
+</td>
           </tr>
         ))}
       </tbody>
