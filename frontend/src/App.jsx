@@ -5,6 +5,7 @@ import "./App.css";
 import logo from "./assets/logo.jpg";
 import Success from "./Success";
 import Cancel from "./NewCancel";
+import QuoteReview from "./QuoteReview";
 /**
  * =========================
  * CONFIG
@@ -972,6 +973,7 @@ const resetTokenFromUrl =
 
 if (path === "/success") return <Success />;
 if (path === "/cancel") return <Cancel />;
+  if (path.startsWith("/quote/")) return <QuoteReview />;
 
   // ===== ADMIN ROUTE =====
   if (window.location.pathname === "/admin") return <Admin />;
