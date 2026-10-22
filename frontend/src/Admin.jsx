@@ -1071,7 +1071,15 @@ alert("CSV imported successfully");
 >
   Create Order
 </button>
-   
+ 
+<button
+  className="btn"
+  style={{ marginLeft: 10 }}
+  onClick={() => setAdminTab("quotes")}
+>
+  Quotes
+</button>
+  
 <button
   className="btn"
   style={{
@@ -1417,6 +1425,17 @@ alert("CSV imported successfully");
     <AdminZellePending onCount={(n) => setZellePendingCount(n)} />
   </div>
 )}
+ 
+{/* =========================
+    QUOTES TAB
+========================= */}
+{adminTab === "quotes" && (
+  <div className="card" style={{ marginTop: 16 }}>
+    <h2>Quotes</h2>
+    <p>Create and manage customer quotes.</p>
+  </div>
+)}
+     
 {/* =========================
     CREATE ORDER TAB
 ========================= */}
