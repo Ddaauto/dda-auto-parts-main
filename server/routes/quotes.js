@@ -89,6 +89,16 @@ if (!quoteColumns.some((column) => column.name === "expiresAt")) {
   }
 
   router.get("/", (req, res) => {
+    
+db.prepare(`
+  UPDATE quotes
+  SET status = 'EXPIRED',
+      updatedAt = ?
+  WHERE status IN ('DRAFT', 'SENT')
+    AND expiresAt IS NOT NULL
+    AND expiresAt <= ?
+`).run(new Date().toISOString(), new Date().toISOString());
+
     const rows = db.prepare(
       "SELECT * FROM quotes ORDER BY createdAt DESC"
     ).all();
