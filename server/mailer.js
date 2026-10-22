@@ -19,8 +19,13 @@ export async function sendEmail({ to, subject, html, text, attachments = [] }) {
   if (attachments && attachments.length) {
     msg.attachments = attachments;
   }
+const { data, error } = await resend.emails.send(msg);
 
-  await resend.emails.send(msg);
+if (error) {
+  throw new Error(error.message || "Resend failed to send email");
+}
+
+return data;
 }
 
 export async function sendAdminZellePendingEmail(order) {
