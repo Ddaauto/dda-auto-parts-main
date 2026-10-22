@@ -1,18 +1,11 @@
 
 import { Router } from "express";
 import crypto from "crypto";
-
+// Secure customer quote approval links
 export default function createQuotesRouter(db, authRequired) {
   const router = Router();
 
-  router.use(authRequired);
-
-  router.use((req, res, next) => {
-    if (req.user?.role !== "admin") {
-      return res.status(403).json({ error: "Admin only" });
-    }
-    next();
-  });
+ 
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS quotes (
@@ -28,6 +21,7 @@ export default function createQuotesRouter(db, authRequired) {
       notes TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'DRAFT',
       expiresAt TEXT,
+     approvalTokenHash TEXT, 
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     )
@@ -37,6 +31,10 @@ const quoteColumns = db.prepare("PRAGMA table_info(quotes)").all();
 
 if (!quoteColumns.some((column) => column.name === "expiresAt")) {
   db.exec("ALTER TABLE quotes ADD COLUMN expiresAt TEXT");
+}
+
+if (!quoteColumns.some((column) => column.name === "approvalTokenHash")) {
+  db.exec("ALTER TABLE quotes ADD COLUMN approvalTokenHash TEXT");
 }
 
   function calculate(body) {
@@ -87,7 +85,87 @@ if (!quoteColumns.some((column) => column.name === "expiresAt")) {
       total: Number((subtotal + tax + shipping).toFixed(2))
     };
   }
+// PUBLIC CUSTOMER QUOTE ROUTES
+  router.get("/public/:token", (req, res) => {
+  const token = String(req.params.token || "");
 
+  if (!/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(404).json({ error: "Quote not found" });
+  }
+
+  const tokenHash = crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+
+  const quote = db.prepare(`
+    SELECT quoteNumber, customerName, itemsJson,
+           subtotal, tax, shipping, total,
+           notes, status, expiresAt
+    FROM quotes
+    WHERE approvalTokenHash = ?
+  `).get(tokenHash);
+
+  if (!quote) {
+    return res.status(404).json({ error: "Quote not found" });
+  }
+
+  const expired = quote.expiresAt &&
+    new Date(quote.expiresAt).getTime() <= Date.now();
+
+  res.json({
+    ...quote,
+    items: JSON.parse(quote.itemsJson),
+    itemsJson: undefined,
+    status: expired && quote.status === "SENT"
+      ? "EXPIRED"
+      : quote.status
+  });
+});
+  // PUBLIC CUSTOMER APPROVAL OR REJECTION
+  router.post("/public/:token/decision", (req, res) => {
+  const token = String(req.params.token || "");
+  const decision = String(req.body?.decision || "").toUpperCase();
+
+  if (!/^[a-f0-9]{64}$/.test(token)) {
+    return res.status(404).json({ error: "Quote not found" });
+  }
+
+  if (!["ACCEPTED", "REJECTED"].includes(decision)) {
+    return res.status(400).json({ error: "Invalid decision" });
+  }
+
+  const tokenHash = crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+
+  const now = new Date().toISOString();
+
+  const result = db.prepare(`
+    UPDATE quotes
+    SET status = ?, updatedAt = ?
+    WHERE approvalTokenHash = ?
+      AND status = 'SENT'
+      AND expiresAt > ?
+  `).run(decision, now, tokenHash, now);
+
+  if (result.changes !== 1) {
+    return res.status(409).json({
+      error: "Quote unavailable, expired, or already answered"
+    });
+  }
+
+  res.json({ ok: true, status: decision });
+});
+ router.use(authRequired);
+
+router.use((req, res, next) => {
+  if (req.user?.role !== "admin") {
+    return res.status(403).json({ error: "Admin only" });
+  }
+  next();
+});
   router.get("/", (req, res) => {
     
 db.prepare(`
@@ -130,13 +208,17 @@ expiresDate.setUTCDate(expiresDate.getUTCDate() + 30);
 const expiresAt = expiresDate.toISOString();
 
       const quoteNumber = `QT-${Date.now()}-${id.slice(0, 6)}`;
-
+const approvalToken = crypto.randomBytes(32).toString("hex");
+      const approvalTokenHash = crypto
+  .createHash("sha256")
+  .update(approvalToken)
+  .digest("hex");
       db.prepare(`
         INSERT INTO quotes (
           id, quoteNumber, customerName, customerEmail,
           itemsJson, subtotal, tax, shipping, total,
-          notes, status, expiresAt, createdAt, updatedAt
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         notes, status, expiresAt, approvalTokenHash, createdAt, updatedAt
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         quoteNumber,
@@ -150,6 +232,7 @@ const expiresAt = expiresDate.toISOString();
         String(req.body.notes || ""),
         "DRAFT",
 expiresAt,
+approvalTokenHash,        
 now,
 now
       );
@@ -157,7 +240,8 @@ now
       res.status(201).json({
         ok: true,
         id,
-        quoteNumber
+        quoteNumber,
+approvalToken
       });
     } catch (err) {
       res.status(400).json({ error: err.message });
