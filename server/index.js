@@ -43,6 +43,18 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   try {
     if (event.type === "checkout.session.completed") {
   const session = event.data.object;
+    if (session.payment_status !== "paid") {
+  console.log("Stripe session not paid:", session.id);
+  return res.json({ received: true });
+}  
+      const existingOrder = db.prepare(
+  "SELECT id FROM orders WHERE stripeSessionId = ?"
+).get(session.id);
+
+if (existingOrder) {
+  console.log("Stripe session already processed:", session.id);
+  return res.json({ received: true });
+}
   const meta = session?.metadata || {};
 
   console.log("✅ checkout.session.completed:", session.id, "metadata:", meta);
@@ -83,24 +95,48 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     console.error("❌ No line_items found on session:", session.id);
     return res.json({ received: true });
   }
+const fullProducts = await Promise.all(
+  li.map(async (x) => {
+    const productId = x?.price?.product;
 
+    if (!productId) {
+      throw new Error("Stripe product ID missing");
+    }
+
+    return stripeWebhook.products.retrieve(
+      typeof productId === "string" ? productId : productId.id
+    );
+  })
+);
   const cleanItems = li.map((x, idx) => {
-    const name = String(x?.description || `Item ${idx + 1}`);
-    const qty = Math.max(1, Number(x?.quantity || 1));
-    const unitCents = Number(x?.price?.unit_amount || 0);
-    const price = Number((unitCents / 100).toFixed(2));
+  const name = String(x?.description || `Item ${idx + 1}`);
+  const qty = Number(x?.quantity);
+  const unitCents = Number(x?.price?.unit_amount || 0);
+  const price = Number((unitCents / 100).toFixed(2));
 
-    return {
-      id: `stripe_${idx + 1}`,
-      name,
-      sku: "",
-      mpn: "",
-      brand: "",
-      price,
-      qty,
-      weightLb: 1,
-    };
-  });
+  const sku = String(
+    fullProducts[idx]?.metadata?.sku || ""
+  ).trim();
+
+  if (!sku) {
+    throw new Error(`Missing SKU for ${name}`);
+  }
+
+  if (!Number.isSafeInteger(qty) || qty <= 0) {
+    throw new Error(`Invalid quantity for SKU ${sku}`);
+  }
+
+  return {
+    id: `stripe_${idx + 1}`,
+    name,
+    sku,
+    mpn: "",
+    brand: "",
+    price,
+    qty,
+    weightLb: 1,
+  };
+});
 
   // 3) Totales y shipping usando tu misma lógica
   const subtotal = Number(
@@ -122,6 +158,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   const grandTotal = Number((subtotal + taxNum + shippingNum - discounts).toFixed(2));
 
   // 4) Crear orden PAID/Card
+      const saveWebhookOrder = db.transaction(() => {
   const orderId = uid("ord");
   const invoiceId = makeInvoiceId();
   const seq = nextOrderSeq();
@@ -138,9 +175,9 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       shippingCarrier, shippingService, shippingEta,
       shippingMethod, shippingIsEstimated, shippingMeta,
       vehicleLabel, vin, year, make, model, engine, trim,
-      customerSnapshot, itemsJson, status
+    customerSnapshot, itemsJson, status, stripeSessionId
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ).run(
     orderId,
     invoiceId,
@@ -166,11 +203,15 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     vehicleLabel,
     String(vehicle.vin || ""),
     "", "", "", "", "", 
-    JSON.stringify(customer),
-    JSON.stringify(cleanItems),
-    "PAID"
-  );
+   JSON.stringify(customer),
+JSON.stringify(cleanItems),
+"PAID",
+session.id
+);
+  deductInventoryOnceForPaidOrder(db, orderId);
+});
 
+saveWebhookOrder();
   console.log("✅ Order created:", orderNumber, invoiceId);
   console.log("🚀 Starting email block...");
 console.log("📧 customerEmail metadata:", customerEmail);
