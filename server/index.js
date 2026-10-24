@@ -345,7 +345,13 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
     if (pi.status !== "succeeded") {
       return res.status(400).json({ ok: false, error: "Payment not completed" });
     }
+const existingOrder = db.prepare(
+  "SELECT * FROM orders WHERE stripePaymentIntentId = ?"
+).get(pi.id);
 
+if (existingOrder) {
+  return res.json({ ok: true, order: existingOrder });
+}
     const customer = db
       .prepare("SELECT * FROM customers WHERE id = ?")
       .get(req.user.customerId);
@@ -381,16 +387,16 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
     const invoiceId = makeInvoiceId();
     const seq = nextOrderSeq();
     const orderNumber = `ORD-${String(seq).padStart(6, "0")}`;
-
+const savePaidOrder = db.transaction(() => {
     db.prepare(`
       INSERT INTO orders (
         id, invoiceId, orderNumber, orderSeq,
         customerId, createdAt, paymentMethod, paymentStatus,
         subtotal, tax, shipping, grandTotal,
         shippingMethod,
-        customerSnapshot, itemsJson, status
+        customerSnapshot, itemsJson, status, stripePaymentIntentId
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       orderId,
       invoiceId,
@@ -406,10 +412,14 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
       grandTotal,
       chosen.id,
       JSON.stringify(customer),
-      JSON.stringify(cleanItems),
-      "PAID"
-    );
+JSON.stringify(cleanItems),
+"PAID",
+pi.id
+);
+    deductInventoryOnceForPaidOrder(db, orderId);
+});
 
+savePaidOrder();
     const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
 
     const pdfPath = await generateInvoicePDF(order);
@@ -679,35 +689,93 @@ function qtyInt(n) {
 }
 
 function reserveInventoryOrThrow(db, items) {
-  const getStock = db.prepare(`SELECT sku, stock FROM products WHERE sku = ?`);
-  const decStock = db.prepare(`UPDATE products SET stock = stock - ? WHERE sku = ?`);
+  const quantities = new Map();
 
+  // Agrupar cantidades por SKU
   for (const it of items) {
     const sku = String(it.sku || "").trim();
-    const qty = Math.floor(Number(it.qty || 0));
+    const qty = Number(it.qty);
 
     if (!sku) throw new Error("Item missing SKU");
-    if (qty <= 0) throw new Error(`Invalid qty for SKU ${sku}`);
+    if (!Number.isSafeInteger(qty) || qty <= 0) {
+      throw new Error(`Invalid qty for SKU ${sku}`);
+    }
 
+    quantities.set(sku, (quantities.get(sku) || 0) + qty);
+  }
+
+  const getStock = db.prepare(
+    "SELECT stock FROM products WHERE sku = ?"
+  );
+
+  const decStock = db.prepare(
+    "UPDATE products SET stock = stock - ? WHERE sku = ?"
+  );
+
+  // Verificar todas las cantidades antes de descontar
+  for (const [sku, qty] of quantities) {
     const row = getStock.get(sku);
+
     if (!row) throw new Error(`SKU not found: ${sku}`);
 
     const stock = Number(row.stock || 0);
+
     if (stock < qty) {
-      throw new Error(`Not enough stock for ${sku}. Have ${stock}, need ${qty}`);
+      throw new Error(
+        `Not enough stock for ${sku}. Have ${stock}, need ${qty}`
+      );
     }
   }
 
-  for (const it of items) {
-    const sku = String(it.sku || "").trim();
-    const qty = Math.floor(Number(it.qty || 0));
+  // Descontar inventario
+  for (const [sku, qty] of quantities) {
     decStock.run(qty, sku);
   }
+}
+function deductInventoryOnceForPaidOrder(db, orderId) {
+  return db.transaction(() => {
+    const order = db.prepare(
+      "SELECT * FROM orders WHERE id = ?"
+    ).get(orderId);
+
+    if (!order) throw new Error("Order not found");
+
+    if (order.inventoryDeductedAt) {
+      return false;
+    }
+
+    if (String(order.paymentStatus).toUpperCase() !== "PAID") {
+      throw new Error("Payment is not confirmed");
+    }
+
+    const items = JSON.parse(order.itemsJson || "[]");
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("Order has no items");
+    }
+
+    reserveInventoryOrThrow(db, items);
+
+    db.prepare(
+      "UPDATE orders SET inventoryDeductedAt = ? WHERE id = ?"
+    ).run(new Date().toISOString(), orderId);
+
+    return true;
+  })();
 }
 // ✅ Stripe anti-duplicados: guardar session.id en la orden
 try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
 try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
+// Evitar órdenes duplicadas por el mismo pago de Stripe
+if (!columnExists("orders", "stripePaymentIntentId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
+}
 
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
+  ON orders(stripePaymentIntentId)
+  WHERE stripePaymentIntentId IS NOT NULL
+`);
 // =====================================================
 // SHIPPING + TAX SETTINGS
 // =====================================================
@@ -963,7 +1031,23 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+// Relacionar cada orden con su cotización original
+if (!columnExists("orders", "quoteId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN quoteId INTEGER");
+}
+
+// Impedir convertir una cotización dos veces
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_quoteId
+  ON orders(quoteId)
+  WHERE quoteId IS NOT NULL
+`);
+// Control para evitar descontar inventario dos veces
+if (!columnExists("orders", "inventoryDeductedAt")) {
+  db.exec("ALTER TABLE orders ADD COLUMN inventoryDeductedAt TEXT");
+}
 app.use("/api/quotes", createQuotesRouter(db, authRequired));
+
 // =====================================================
 // SHIPPING (Uber + Free Delivery) + TAX
 // =====================================================
@@ -2759,8 +2843,7 @@ app.post("/admin/orders/create", authRequired, (req, res) => {
 
     // ✅ TRANSACTION
     const tx = db.transaction(() => {
-      // 1️⃣ Verify + decrement inventory
-      reserveInventoryOrThrow(db, cleanItems);
+      
 
       // 2️⃣ Insert order
       insertOrder.run(
@@ -2877,14 +2960,20 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
     const nowIso = new Date().toISOString();
     const confirmedBy = String(req.user.email || "");
 
-    db.prepare(`
-      UPDATE orders
-      SET paymentStatus = 'PAID',
-          status = 'PAID',
-          confirmedBy = ?,
-          confirmedAt = ?
-      WHERE id = ?
-    `).run(confirmedBy, nowIso, id);
+    const confirmPayment = db.transaction(() => {
+  db.prepare(`
+    UPDATE orders
+    SET paymentStatus = 'PAID',
+        status = 'PAID',
+        confirmedBy = ?,
+        confirmedAt = ?
+    WHERE id = ?
+  `).run(confirmedBy, nowIso, id);
+
+  deductInventoryOnceForPaidOrder(db, id);
+});
+
+confirmPayment();
 
     const updated = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id);
 
