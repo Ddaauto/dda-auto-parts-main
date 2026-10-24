@@ -1763,6 +1763,45 @@ alert("CSV imported successfully");
       Send Quote
     </button>
   )}
+  {q.status === "ACCEPTED" && (
+    <button
+      type="button"
+      className="btn btnPrimary"
+      onClick={async () => {
+        if (!window.confirm(
+          `Convert quote ${q.quoteNumber} into a PENDING order? Inventory will be deducted.`
+        )) return;
+
+        try {
+          const token = localStorage.getItem("token") || "";
+
+          const res = await fetch(
+            `${API}/admin/quotes/${q.id}/convert`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            }
+          );
+
+          const data = await res.json();
+
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || "Conversion failed");
+          }
+
+          alert(`Order ${data.orderNumber} created successfully!`);
+          await loadQuotes();
+
+        } catch (err) {
+          alert(err.message || "Error converting quote");
+        }
+      }}
+    >
+      Convert to Order
+    </button>
+  )}              
 </td>
           </tr>
         ))}
