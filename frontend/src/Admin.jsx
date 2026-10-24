@@ -1739,7 +1739,7 @@ alert("CSV imported successfully");
         try {
           const token = localStorage.getItem("token") || "";
           const res = await fetch(
-           `${API}/quotes/${q.id}/send`,
+           `${API}/api/quotes/${q.id}/send`,
             {
               method: "POST",
               headers: {
