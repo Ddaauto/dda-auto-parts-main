@@ -12,7 +12,6 @@ import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
 import stripeRoutes from "./routes/stripe.js";
-import createQuotesRouter from "./routes/quotes.js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
@@ -964,135 +963,9 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
-// Relacionar cada orden con su cotización original
-if (!columnExists("orders", "quoteId")) {
-  db.exec("ALTER TABLE orders ADD COLUMN quoteId INTEGER");
-}
 
-// Impedir convertir una cotización dos veces
-db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_quoteId
-  ON orders(quoteId)
-  WHERE quoteId IS NOT NULL
-`);
-app.use("/api/quotes", createQuotesRouter(db, authRequired));
-app.post("/admin/quotes/:id/convert", authRequired, (req, res) => {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ error: "Admin only" });
-  }
 
-  try {
-    const result = db.transaction(() => {
-      const quote = db.prepare(
-        "SELECT * FROM quotes WHERE id = ?"
-      ).get(req.params.id);
 
-      if (!quote) throw new Error("Quote not found");
-
-      if (quote.status !== "ACCEPTED") {
-        throw new Error("Only accepted quotes can be converted");
-      }
-
-      const previous = db.prepare(
-        "SELECT id FROM orders WHERE quoteId = ?"
-      ).get(quote.id);
-
-      if (previous) {
-        throw new Error("This quote was already converted");
-      }
-
-      const items = JSON.parse(quote.itemsJson || "[]");
-
-      if (!Array.isArray(items) || items.length === 0) {
-        throw new Error("Quote has no items");
-      }
-
-      const quantities = new Map();
-
-      for (const item of items) {
-        const sku = String(item.sku || "").trim();
-        const qty = Number(item.qty);
-
-        if (!sku || !Number.isSafeInteger(qty) || qty <= 0) {
-          throw new Error("Every item needs a SKU and valid quantity");
-        }
-
-        quantities.set(sku, (quantities.get(sku) || 0) + qty);
-      }
-
-      const inventoryItems = [...quantities].map(([sku, qty]) => ({
-        sku,
-        qty
-      }));
-
-      const email = String(quote.customerEmail || "")
-        .trim().toLowerCase();
-
-      if (!email) throw new Error("Customer email is required");
-
-      const customer = db.prepare(
-        "SELECT * FROM customers WHERE lower(email) = ?"
-      ).get(email);
-
-      if (!customer) {
-        throw new Error(
-          "Customer must be registered before conversion"
-        );
-      }
-
-      const seq = nextOrderSeq();
-      const orderId = uid("ord");
-      const invoiceId = makeInvoiceId();
-      const orderNumber = `ORD-${String(seq).padStart(6, "0")}`;
-
-      // Validar y descontar inventario dentro de la transacción
-      reserveInventoryOrThrow(db, inventoryItems);
-
-      db.prepare(`
-        INSERT INTO orders (
-          id, invoiceId, orderNumber, orderSeq,
-          customerId, createdAt,
-          paymentMethod, paymentStatus, status,
-          subtotal, salesTax, discounts, total,
-          tax, shipping, grandTotal,
-          customerSnapshot, itemsJson, quoteId
-        )
-        VALUES (
-          ?, ?, ?, ?, ?, ?,
-          ?, ?, ?,
-          ?, ?, ?, ?,
-          ?, ?, ?,
-          ?, ?, ?
-        )
-      `).run(
-        orderId, invoiceId, orderNumber, seq,
-        customer.id, nowISO(),
-        "Pending", "PENDING", "PENDING",
-        Number(quote.subtotal), Number(quote.tax), 0,
-        Number(quote.subtotal),
-        Number(quote.tax), Number(quote.shipping),
-        Number(quote.total),
-        JSON.stringify(customer),
-        JSON.stringify(items),
-        quote.id
-      );
-
-      db.prepare(`
-        UPDATE quotes
-        SET status = 'CONVERTED', updatedAt = ?
-        WHERE id = ?
-      `).run(nowISO(), quote.id);
-
-      return { orderId, orderNumber, invoiceId };
-    })();
-
-    return res.json({ ok: true, ...result });
-
-  } catch (err) {
-    console.error("Quote conversion error:", err);
-    return res.status(400).json({ error: err.message });
-  }
-});
 // =====================================================
 // SHIPPING (Uber + Free Delivery) + TAX
 // =====================================================
