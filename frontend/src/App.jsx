@@ -12,6 +12,8 @@ import QuoteReview from "./QuoteReview";
  * =========================
  */
 const API = import.meta.env.VITE_API_URL || "http://localhost:5177";
+// Read-only public catalog; checkout and account requests remain on the isolated preview API.
+const CATALOG_API = import.meta.env.VITE_CATALOG_API_URL || API;
 const YEARS = Array.from({ length: 36 }, (_, i) => 2026 - i);
 const OTHER = "__OTHER__";
 
@@ -1253,7 +1255,7 @@ const [shippingLoading, setShippingLoading] = useState(false);
   useEffect(() => {
   const load = async () => {
     try {
-      const r = await fetch(`${API}/products`);
+      const r = await fetch(`${CATALOG_API}/products`);
       const data = await r.json();
 
       const normalized = (Array.isArray(data) ? data : []).map((p) => ({
