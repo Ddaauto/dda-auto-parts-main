@@ -63,11 +63,44 @@ export default function Admin() {
 const [quotes, setQuotes] = useState([]);
 const [quotesLoading, setQuotesLoading] = useState(false);
 const [quoteCustomerName, setQuoteCustomerName] = useState("");
+const [quoteCustomerId, setQuoteCustomerId] = useState("");
+const [quoteCustomerSearch, setQuoteCustomerSearch] = useState("");
+const [quoteCustomerOpen, setQuoteCustomerOpen] = useState(false);
+const [quoteTaxLoading, setQuoteTaxLoading] = useState(false);
+const [quoteTaxError, setQuoteTaxError] = useState("");
 const [quoteCustomerEmail, setQuoteCustomerEmail] = useState("");
 const [quoteItems, setQuoteItems] = useState([]);
 const [quoteNotes, setQuoteNotes] = useState("");
 const [quoteTax, setQuoteTax] = useState(0);
 const [quoteShipping, setQuoteShipping] = useState(0);
+
+  const matchingQuoteCustomers = customers.filter((c) => [c.firstName, c.lastName, c.businessName, c.email, c.phone, c.zip].some((v) => String(v || "").toLowerCase().includes(quoteCustomerSearch.toLowerCase()))).slice(0, 30);
+  const quoteSubtotal = quoteItems.reduce((sum, item) => sum + Number(item.qty) * Number(item.price), 0);
+  useEffect(() => {
+    if (!quoteCustomerId || !quoteItems.length) {
+      setQuoteTax(0);
+      setQuoteTaxError("");
+      return;
+    }
+    let cancelled = false;
+    const timeout = setTimeout(async () => {
+      setQuoteTaxLoading(true);
+      setQuoteTaxError("");
+      try {
+        const response = await fetch(`${API}/api/quotes/tax-preview`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
+          body: JSON.stringify({ customerId: quoteCustomerId, items: quoteItems, shipping: Number(quoteShipping) || 0 })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Tax calculation failed");
+        if (!cancelled) setQuoteTax(data.tax);
+      } catch (err) {
+        if (!cancelled) { setQuoteTaxError(err.message); setQuoteTax(0); }
+      } finally { if (!cancelled) setQuoteTaxLoading(false); }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(timeout); };
+  }, [quoteCustomerId, quoteItems, quoteShipping]);
 
   const [customers, setCustomers] = useState([]);
   const [customerSearch, setCustomerSearch] = useState("");
@@ -1117,6 +1150,7 @@ alert("CSV imported successfully");
   onClick={() => {
   setAdminTab("quotes");
   loadQuotes();
+  loadCustomers();
 }}
 >
   Quotes
@@ -1478,20 +1512,22 @@ alert("CSV imported successfully");
 <div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
   <h3>Create New Quote</h3>
 
-  <input
-    className="input"
-    placeholder="Customer name"
-    value={quoteCustomerName}
-    onChange={(e) => setQuoteCustomerName(e.target.value)}
-  />
-
-  <input
-    className="input"
-    type="email"
-    placeholder="Customer email"
-    value={quoteCustomerEmail}
-    onChange={(e) => setQuoteCustomerEmail(e.target.value)}
-  />
+  <label>Find existing customer (name, email, phone, ZIP)</label>
+  <input className="input" placeholder="Search customer..." value={quoteCustomerSearch}
+    onFocus={() => { setQuoteCustomerOpen(true); if (!customers.length) loadCustomers(); }}
+    onChange={(e) => { setQuoteCustomerSearch(e.target.value); setQuoteCustomerOpen(true); setQuoteCustomerId(""); setQuoteCustomerName(""); setQuoteCustomerEmail(""); }} />
+  {quoteCustomerOpen && (
+    <div style={{ maxHeight: 190, overflowY: "auto", border: "1px solid #ccc", borderRadius: 6 }}>
+      {matchingQuoteCustomers.map((c) => (
+        <button key={c.id} type="button" className="btn" style={{ display: "block", width: "100%", textAlign: "left" }}
+          onClick={() => { setQuoteCustomerId(c.id); setQuoteCustomerName([c.firstName, c.lastName].filter(Boolean).join(" ") || c.businessName || c.email); setQuoteCustomerEmail(c.email || ""); setQuoteCustomerSearch(`${c.firstName || ""} ${c.lastName || ""} — ${c.email || ""} — ${c.phone || ""}`.trim()); setQuoteCustomerOpen(false); }}>
+          {[c.firstName, c.lastName].filter(Boolean).join(" ")} {c.businessName ? `(${c.businessName})` : ""} — {c.email} — {c.phone || "No phone"}
+        </button>
+      ))}
+      {!matchingQuoteCustomers.length && <p style={{ padding: 8 }}>No matching customers</p>}
+    </div>
+  )}
+  {quoteCustomerId && <div>Selected: <strong>{quoteCustomerName}</strong> ({quoteCustomerEmail})</div>}
   
 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
   <select
@@ -1597,16 +1633,10 @@ alert("CSV imported successfully");
 )}
 
 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-  <label>
-    Tax ($)
-    <input
-      className="input"
-      type="number"
-      min="0"
-      step="0.01"
-      value={quoteTax}
-      onChange={(e) => setQuoteTax(e.target.value)}
-    />
+  <label>Tax ($) — calculated automatically
+    <input className="input" value={Number(quoteTax || 0).toFixed(2)} readOnly />
+    {quoteTaxLoading && <small>Calculating tax...</small>}
+    {quoteTaxError && <small style={{ color: "red" }}>{quoteTaxError}</small>}
   </label>
 
   <label>
@@ -1650,14 +1680,15 @@ alert("CSV imported successfully");
   className="btn btnPrimary"
   type="button"
   onClick={async () => {
-    if (!quoteCustomerName.trim()) {
-      return alert("Enter customer name");
+    if (!quoteCustomerId) {
+      return alert("Select an existing customer");
     }
 
     if (quoteItems.length === 0) {
       return alert("Add at least one product");
     }
 
+    if (quoteTaxLoading || quoteTaxError) return alert("Wait for a successful tax calculation");
     try {
       const token = localStorage.getItem("token");
 
@@ -1668,6 +1699,7 @@ alert("CSV imported successfully");
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
+          customerId: quoteCustomerId,
           customerName: quoteCustomerName.trim(),
           customerEmail: quoteCustomerEmail.trim(),
           items: quoteItems,
@@ -1686,6 +1718,8 @@ alert("CSV imported successfully");
       alert(`Quote ${data.quoteNumber} saved successfully`);
 
       setQuoteCustomerName("");
+      setQuoteCustomerId("");
+      setQuoteCustomerSearch("");
       setQuoteCustomerEmail("");
       setQuoteItems([]);
       setQuoteTax(0);

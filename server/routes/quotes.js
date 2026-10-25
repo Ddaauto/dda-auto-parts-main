@@ -512,6 +512,24 @@ db.prepare(`
     })));
   });
 
+  // Tax follows the existing checkout rule (7%, or exempt with a resale certificate).
+  // Both preview and save calculate on the server, never from a browser-supplied rate.
+  function quoteTaxForCustomer(customerId, subtotal) {
+    const customer = db.prepare("SELECT id, resaleTaxNumber FROM customers WHERE id = ?").get(String(customerId || ""));
+    if (!customer) throw new Error("Select an existing customer");
+    return String(customer.resaleTaxNumber || "").trim() ? 0 : Number((subtotal * 0.07).toFixed(2));
+  }
+
+  router.post("/tax-preview", (req, res) => {
+    try {
+      const totals = calculate({ ...req.body, tax: 0 });
+      const tax = quoteTaxForCustomer(req.body.customerId, totals.subtotal);
+      res.json({ subtotal: totals.subtotal, tax, total: Number((totals.subtotal + tax + totals.shipping).toFixed(2)) });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
   router.post("/", (req, res) => {
     try {
       const customerName = String(
@@ -524,7 +542,9 @@ db.prepare(`
         });
       }
 
-      const totals = calculate(req.body);
+      const preliminary = calculate({ ...req.body, tax: 0 });
+      const tax = quoteTaxForCustomer(req.body.customerId, preliminary.subtotal);
+      const totals = calculate({ ...req.body, tax });
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
       
