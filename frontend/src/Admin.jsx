@@ -1150,6 +1150,7 @@ alert("CSV imported successfully");
   onClick={() => {
   setAdminTab("quotes");
   loadQuotes();
+  loadCustomers();
 }}
 >
   Quotes
