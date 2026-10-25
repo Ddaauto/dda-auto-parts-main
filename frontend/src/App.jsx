@@ -1473,6 +1473,11 @@ setShippingChoice(opts[0]?.id || "");
 
   const openCheckout = async () => {
     if (!cart.length) return;
+    if (!me) {
+      setAuthTab("login");
+      go("/login");
+      return;
+    }
 
     const c = me?.customer || {};
     // require complete address
@@ -1879,7 +1884,7 @@ if (resetTokenFromUrl) {
     </div>
   );
 }
-  if (!me) {
+  if (!me && (route === "/login" || route === "/register" || route === "/account")) {
     return (
       <div className="container">
         <div className="card" style={{ maxWidth: 720, margin: "20px auto" }}>
@@ -1888,7 +1893,7 @@ if (resetTokenFromUrl) {
             <div>
               <h2 style={{ margin: 0 }}>DDA Auto Parts</h2>
               <div style={{ color: "var(--muted)", marginTop: 4, fontSize: 13 }}>
-                Login required to access the store.
+                Sign in or register to complete your purchase and access your account.
               </div>
             </div>
           </div>
@@ -2016,11 +2021,11 @@ if (resetTokenFromUrl) {
   </div>
 
   <div className="pills">
-    <button className="btn" onClick={() => go("/account")}>
-      My Account
+    <button className="btn" onClick={() => { setAuthTab("login"); go(me ? "/account" : "/login"); }}>
+      {me ? "My Account" : "Login / Register"}
     </button>
 
-    <button
+    {me && <button
       className="btn"
       onClick={() => {
         setToken("");
@@ -2029,7 +2034,7 @@ if (resetTokenFromUrl) {
       }}
     >
       Logout
-    </button>
+    </button>}
 
     
     <button className="btn" onClick={() => setCartOpen(true)}>
