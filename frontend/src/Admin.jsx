@@ -107,8 +107,10 @@ const [dashboardStats, setDashboardStats] = useState({
 });
 const [dashboardLoading, setDashboardLoading] = useState(false);
 useEffect(() => {
-  loadDashboard();
-}, []);
+  if (authorized && localStorage.getItem("token")) {
+    loadDashboard();
+  }
+}, [authorized]);
 function toggleProductSort(key) {
   setProductSortKey((prevKey) => {
     if (prevKey === key) {
