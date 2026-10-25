@@ -858,7 +858,7 @@ function deductInventoryOnceForPaidOrder(db, orderId) {
 // =====================================================
 // SHIPPING + TAX SETTINGS
 // =====================================================
-const ORIGIN_ZIP = "33010";
+const ORIGIN_ZIP = "33018";
 const UBER_MAX_MILES = 20;
 
 // =====================================================
