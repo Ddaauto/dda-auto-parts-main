@@ -5,7 +5,7 @@ import { sendEmail } from "../mailer.js";
 import PDFDocument from "pdfkit";
 
 // Secure customer quote approval links
-export default function createQuotesRouter(db, authRequired) {
+export default function createQuotesRouter(db, authRequired, { makeInvoiceId, nextOrderSeq } = {}) {
   const router = Router();
 
  
@@ -209,58 +209,158 @@ doc.end();
       : quote.status
   });
 });
+  
   // PUBLIC CUSTOMER APPROVAL OR REJECTION
   router.post("/public/:token/decision", (req, res) => {
-  const token = String(req.params.token || "");
-  const decision = String(req.body?.decision || "").toUpperCase();
+    const token = String(req.params.token || "");
+    const decision = String(req.body?.decision || "").toUpperCase();
 
-  if (!/^[a-f0-9]{64}$/.test(token)) {
-    return res.status(404).json({ error: "Quote not found" });
-  }
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      return res.status(404).json({ error: "Quote not found" });
+    }
 
-  if (!["ACCEPTED", "REJECTED"].includes(decision)) {
-    return res.status(400).json({ error: "Invalid decision" });
-  }
+    if (!["ACCEPTED", "REJECTED"].includes(decision)) {
+      return res.status(400).json({ error: "Invalid decision" });
+    }
 
-  const tokenHash = crypto
-    .createHash("sha256")
-    .update(token)
-    .digest("hex");
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
 
-  const now = new Date().toISOString();
+    const now = new Date().toISOString();
 
-  const result = db.prepare(`
-    UPDATE quotes
-    SET status = ?, updatedAt = ?
-    WHERE approvalTokenHash = ?
-      AND status = 'SENT'
-      AND expiresAt > ?
-  `).run(decision, now, tokenHash, now);
+    try {
+      const result = db.transaction(() => {
+        const quote = db.prepare(
+          "SELECT * FROM quotes WHERE approvalTokenHash = ?"
+        ).get(tokenHash);
 
-  if (result.changes !== 1) {
-    return res.status(409).json({
-      error: "Quote unavailable, expired, or already answered"
-    });
-  }
+        if (!quote) {
+          return { error: "Quote not found", code: 404 };
+        }
 
-  res.json({ ok: true, status: decision });
- 
+        if (quote.status === "ACCEPTED" && decision === "ACCEPTED") {
+          const existing = db.prepare(
+            "SELECT id, orderNumber FROM orders WHERE quoteId = ?"
+          ).get(quote.id);
 
-const quote = db.prepare(`
-  SELECT quoteNumber, customerName, customerEmail, total
-  FROM quotes
-  WHERE approvalTokenHash = ?
-`).get(tokenHash);
+          if (existing) {
+            return {
+              status: "ACCEPTED",
+              orderId: existing.id,
+              orderNumber: existing.orderNumber,
+              alreadyProcessed: true
+            };
+          }
 
-const adminEmail = process.env.ADMIN_NOTIFY_EMAIL;
+          return { error: "Accepted quote has no linked order", code: 409 };
+        }
 
-if (quote && adminEmail) {
-  const action = decision === "ACCEPTED" ? "ACCEPTED" : "REJECTED";
+        if (
+          quote.status !== "SENT" ||
+          !quote.expiresAt ||
+          quote.expiresAt <= now
+        ) {
+          return {
+            error: "Quote unavailable, expired, or already answered",
+            code: 409
+          };
+        }
 
-  sendEmail({
-    to: adminEmail,
-    subject: `Quotation ${quote.quoteNumber} - ${action}`,
-    text: `
+        if (decision === "REJECTED") {
+          db.prepare(
+            "UPDATE quotes SET status = 'REJECTED', updatedAt = ? WHERE id = ?"
+          ).run(now, quote.id);
+
+          return { status: "REJECTED", quote };
+        }
+
+        if (
+          typeof makeInvoiceId !== "function" ||
+          typeof nextOrderSeq !== "function"
+        ) {
+          throw new Error("Order numbering helpers not configured");
+        }
+
+        const customer = db.prepare(
+          "SELECT * FROM customers WHERE lower(email) = ?"
+        ).get(String(quote.customerEmail || "").trim().toLowerCase());
+
+        if (!customer) {
+          return { error: "Customer account not found", code: 409 };
+        }
+
+        const items = JSON.parse(quote.itemsJson || "[]");
+
+        if (
+          !Array.isArray(items) ||
+          !items.length ||
+          items.some(item =>
+            !String(item.sku || "").trim() ||
+            !Number.isSafeInteger(Number(item.qty)) ||
+            Number(item.qty) <= 0
+          )
+        ) {
+          return {
+            error: "Quote items require valid SKU and quantity",
+            code: 400
+          };
+        }
+
+        const orderId = `ord_${crypto.randomUUID()}`;
+        const invoiceId = makeInvoiceId();
+        const seq = nextOrderSeq();
+        const orderNumber = `ORD-${String(seq).padStart(6, "0")}`;
+
+        db.prepare(`
+          INSERT INTO orders (
+            id, invoiceId, orderNumber, orderSeq,
+            customerId, createdAt, paymentMethod, paymentStatus,
+            subtotal, salesTax, discounts, total,
+            tax, shipping, grandTotal,
+            customerSnapshot, itemsJson, status, quoteId
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          )
+        `).run(
+          orderId, invoiceId, orderNumber, seq,
+          customer.id, now, "UNSELECTED", "PENDING",
+          quote.subtotal, quote.tax, 0, quote.subtotal,
+          quote.tax, quote.shipping, quote.total,
+          JSON.stringify(customer), quote.itemsJson,
+          "PENDING", quote.id
+        );
+
+        db.prepare(
+          "UPDATE quotes SET status = 'ACCEPTED', updatedAt = ? WHERE id = ?"
+        ).run(now, quote.id);
+
+        return { status: "ACCEPTED", quote, orderId, orderNumber };
+      })();
+
+      if (result.error) {
+        return res.status(result.code).json({ error: result.error });
+      }
+
+      res.json({
+        ok: true,
+        status: result.status,
+        orderId: result.orderId || null,
+        orderNumber: result.orderNumber || null,
+        alreadyProcessed: !!result.alreadyProcessed
+      });
+
+      const quote = result.quote;
+      const adminEmail = process.env.ADMIN_NOTIFY_EMAIL;
+
+      if (quote && adminEmail && !result.alreadyProcessed) {
+        const action = decision === "ACCEPTED" ? "ACCEPTED" : "REJECTED";
+
+        sendEmail({
+          to: adminEmail,
+          subject: `Quotation ${quote.quoteNumber} - ${action}`,
+          text: `
 DDA Auto Parts - Quotation Update
 
 Quote: ${quote.quoteNumber}
@@ -271,12 +371,19 @@ Total: $${Number(quote.total).toFixed(2)}
 Customer decision: ${action}
 
 Log in to ADMIN to review this quotation.
-    `,
-  }).catch((err) => {
-    console.error("Quote admin notification error:", err);
+          `
+        }).catch(err => {
+          console.error("Quote admin notification error:", err);
+        });
+      }
+    } catch (err) {
+      console.error("Quote decision error:", err);
+      return res.status(500).json({
+        error: "Unable to process quote decision"
+      });
+    }
   });
-}  
-});
+
  router.use(authRequired);
 
 router.use((req, res, next) => {
