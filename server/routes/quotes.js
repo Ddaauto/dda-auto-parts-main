@@ -449,7 +449,7 @@ Log in to ADMIN to review this quotation.
         if (existing.status === "open" && existing.url) return res.json({ ok: true, url: existing.url });
         if (existing.payment_status === "paid") return res.status(409).json({ error: "Payment is processing" });
       }
-      const frontend = String(process.env.FRONTEND_URL || "").replace(/\\/$/, "");
+      const frontend = String(process.env.FRONTEND_URL || "").replace(/\/$/, "");
       if (!/^https:\/\//.test(frontend)) {
         return res.status(503).json({ error: "FRONTEND_URL must be configured with HTTPS" });
       }
