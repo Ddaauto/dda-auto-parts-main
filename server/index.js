@@ -16,7 +16,6 @@ import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
 
-
 const app = express();
 // ================================
 // STRIPE WEBHOOK (RAW) - DEBE IR AQUI ARRIBA
