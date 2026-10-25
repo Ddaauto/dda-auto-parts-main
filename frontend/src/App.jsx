@@ -1471,8 +1471,13 @@ setShippingChoice(opts[0]?.id || "");
   const openCheckout = async () => {
     if (!cart.length) return;
     if (!me) {
-      setAuthTab("login");
-      go("/login");
+      const continueToLogin = window.confirm(
+        "To complete your purchase, please sign in or create an account. Your shopping cart will be saved.\\n\\nPress OK to continue, or Cancel to keep shopping."
+      );
+      if (continueToLogin) {
+        setAuthTab("login");
+        go("/login");
+      }
       return;
     }
 
