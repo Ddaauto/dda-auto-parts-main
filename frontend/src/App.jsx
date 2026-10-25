@@ -1321,12 +1321,7 @@ const [shippingLoading, setShippingLoading] = useState(false);
     });
   }, [adminProducts, q, makeCanon, modelValue, engineValue, year]);
 
-  const canShowProducts = useMemo(() => {
-  if (norm(q).length > 0) return true;
-  if (categoryFilter) return true;
-  if (makeCanon && modelValue && normalizeEngine(engineValue)) return true;
-  return false;
-}, [q, categoryFilter, makeCanon, modelValue, engineValue]);
+  const canShowProducts = true;
 const visibleProducts = useMemo(() => {
   return filtered.filter(
     (p) =>
@@ -2615,7 +2610,7 @@ if (resetTokenFromUrl) {
           </div>
         ) : !canShowProducts ? (
           <div className="card" style={{ color: "var(--muted)" }}>
-            Search by part number or select Year, Make and Model to find compatible parts.
+            Browse all available products, or search by part number or vehicle.
           </div>
         ) : filtered.length === 0 ? (
           <div className="card" style={{ color: "var(--muted)" }}>
