@@ -2708,7 +2708,7 @@ if (resetTokenFromUrl) {
     <div style={{ fontWeight: 900, marginBottom: 6 }}>Zelle info</div>
     <div>Email: <b>ddaautoparts@gmail.com</b></div>
     <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 13 }}>
-      Confirmación manual. Incluye tu número de orden en la nota de Zelle.
+      Payment requires manual confirmation. Include your order number in the Zelle payment memo.
     </div>
   </div>
 )}
