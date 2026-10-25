@@ -16,6 +16,7 @@ export default function Register({ onRegistered }) {
     resaleTaxNumber: "",
   });
 
+  const API = import.meta.env.VITE_API_URL || "http://localhost:5177";
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -43,7 +44,7 @@ export default function Register({ onRegistered }) {
     try {
   setLoading(true);
 
-  const r = await fetch("https://dda-backend-ajr3.onrender.com/auth/register", {
+  const r = await fetch(`${API}/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(form),
