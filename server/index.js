@@ -1086,7 +1086,10 @@ db.exec(`
 if (!columnExists("orders", "inventoryDeductedAt")) {
   db.exec("ALTER TABLE orders ADD COLUMN inventoryDeductedAt TEXT");
 }
-app.use("/api/quotes", createQuotesRouter(db, authRequired));
+app.use("/api/quotes", createQuotesRouter(db, authRequired, {
+  makeInvoiceId,
+  nextOrderSeq
+}));
 
 // =====================================================
 // SHIPPING (Uber + Free Delivery) + TAX
