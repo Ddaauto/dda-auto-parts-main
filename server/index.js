@@ -1090,6 +1090,16 @@ CREATE TABLE IF NOT EXISTS zip_geo (
 );
 `);
 
+// Preview-only ZIP coordinates from the uploaded uszips.csv.
+// Seed on boot because the test database starts without the ZIP import.
+if (process.env.NODE_ENV === "test") {
+  const insertPreviewZip = db.prepare(
+    "INSERT OR IGNORE INTO zip_geo (zip, lat, lon) VALUES (?, ?, ?)"
+  );
+  insertPreviewZip.run("33010", 25.83309, -80.27902);
+  insertPreviewZip.run("33018", 25.92, -80.39274);
+}
+
 // =====================================================
 // HELPERS
 // =====================================================
