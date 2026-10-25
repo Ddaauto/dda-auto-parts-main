@@ -1453,6 +1453,10 @@ app.post("/auth/forgot-password", async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     }
 
+    if (process.env.NODE_ENV === "test") {
+      return res.status(503).json({ error: "Password reset emails are disabled on this preview server. No reset email was sent." });
+    }
+
     const customer = db.prepare(`
       SELECT id, email, firstName, lastName
       FROM customers
@@ -1476,7 +1480,7 @@ db.prepare(`
   SET resetToken = ?, resetTokenExpiresAt = ?
   WHERE email = ?
 `).run(token, expiresAt, customer.email);
-    const resetLink = `http://localhost:5173/?reset_token=${encodeURIComponent(token)}`;
+    const resetLink = `${String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "")}/?reset_token=${encodeURIComponent(token)}`;
 
     const fullName =
       [customer.firstName, customer.lastName].filter(Boolean).join(" ").trim() || "Customer";
