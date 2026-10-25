@@ -149,7 +149,7 @@ export default function QuoteReview() {
                 <p style={{ fontSize: 13, color: "#526171" }}>Inventory is updated only after payment is confirmed.</p>
               </section>
             )}
-            {quote.status === "EXPIRED" && <p>This quotation has expired.</p>
+            {quote.status === "EXPIRED" && <p>This quotation has expired.</p>}
           </>
         )}
       </section>
