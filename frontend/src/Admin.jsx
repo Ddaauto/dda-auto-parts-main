@@ -73,12 +73,16 @@ const [quoteItems, setQuoteItems] = useState([]);
 const [quoteNotes, setQuoteNotes] = useState("");
 const [quoteTax, setQuoteTax] = useState(0);
 const [quoteShipping, setQuoteShipping] = useState(0);
+const [quoteShippingId, setQuoteShippingId] = useState("");
+const [quoteShippingOptions, setQuoteShippingOptions] = useState([]);
 
   const matchingQuoteCustomers = customers.filter((c) => [c.firstName, c.lastName, c.businessName, c.email, c.phone, c.zip].some((v) => String(v || "").toLowerCase().includes(quoteCustomerSearch.toLowerCase()))).slice(0, 30);
   const quoteSubtotal = quoteItems.reduce((sum, item) => sum + Number(item.qty) * Number(item.price), 0);
   useEffect(() => {
     if (!quoteCustomerId || !quoteItems.length) {
       setQuoteTax(0);
+      setQuoteShipping(0);
+      setQuoteShippingOptions([]);
       setQuoteTaxError("");
       return;
     }
@@ -90,17 +94,27 @@ const [quoteShipping, setQuoteShipping] = useState(0);
         const response = await fetch(`${API}/api/quotes/tax-preview`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
-          body: JSON.stringify({ customerId: quoteCustomerId, items: quoteItems, shipping: Number(quoteShipping) || 0 })
+          body: JSON.stringify({ customerId: quoteCustomerId, items: quoteItems, selectedShippingId: quoteShippingId })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Tax calculation failed");
-        if (!cancelled) setQuoteTax(data.tax);
+        if (!cancelled) {
+          setQuoteTax(data.tax);
+          setQuoteShippingOptions(data.options || []);
+          const available = (data.options || []).find(o => o.id === quoteShippingId);
+          if (!available) {
+            setQuoteShippingId((data.options || [])[0]?.id || "");
+            setQuoteShipping(0);
+          } else {
+            setQuoteShipping(Number(available.amount));
+          }
+        }
       } catch (err) {
         if (!cancelled) { setQuoteTaxError(err.message); setQuoteTax(0); }
       } finally { if (!cancelled) setQuoteTaxLoading(false); }
     }, 250);
     return () => { cancelled = true; clearTimeout(timeout); };
-  }, [quoteCustomerId, quoteItems, quoteShipping]);
+  }, [quoteCustomerId, quoteItems, quoteShippingId]);
 
   const [customers, setCustomers] = useState([]);
   const [customerSearch, setCustomerSearch] = useState("");
@@ -1576,6 +1590,7 @@ alert("CSV imported successfully");
         name: product.name,
         qty,
         price: Number(product.price || 0),
+        weightLb: Number(product.weightLb || product.weight_lb || 1),
       },
     ]);
 
@@ -1639,16 +1654,16 @@ alert("CSV imported successfully");
     {quoteTaxError && <small style={{ color: "red" }}>{quoteTaxError}</small>}
   </label>
 
-  <label>
-    Shipping ($)
-    <input
-      className="input"
-      type="number"
-      min="0"
-      step="0.01"
-      value={quoteShipping}
-      onChange={(e) => setQuoteShipping(e.target.value)}
-    />
+  <label>Shipping — calculated automatically
+    <select className="input" value={quoteShippingId} onChange={(e) => setQuoteShippingId(e.target.value)}>
+      <option value="">Select shipping...</option>
+      {quoteShippingOptions.map((option) => (
+        <option key={option.id} value={option.id}>
+          {option.carrier} — {option.service} — ${Number(option.amount).toFixed(2)}{option.isEstimated ? " (estimate)" : ""}
+        </option>
+      ))}
+    </select>
+    <small>Shipping: ${Number(quoteShipping || 0).toFixed(2)}</small>
   </label>
 </div>
 
@@ -1689,6 +1704,7 @@ alert("CSV imported successfully");
     }
 
     if (quoteTaxLoading || quoteTaxError) return alert("Wait for a successful tax calculation");
+    if (!quoteShippingId || !quoteShippingOptions.some(o => o.id === quoteShippingId)) return alert("Select an available shipping option");
     try {
       const token = localStorage.getItem("token");
 
@@ -1700,6 +1716,7 @@ alert("CSV imported successfully");
         },
         body: JSON.stringify({
           customerId: quoteCustomerId,
+          selectedShippingId: quoteShippingId,
           customerName: quoteCustomerName.trim(),
           customerEmail: quoteCustomerEmail.trim(),
           items: quoteItems,
@@ -1724,6 +1741,8 @@ alert("CSV imported successfully");
       setQuoteItems([]);
       setQuoteTax(0);
       setQuoteShipping(0);
+      setQuoteShippingId("");
+      setQuoteShippingOptions([]);
       setQuoteNotes("");
 
       await loadQuotes();

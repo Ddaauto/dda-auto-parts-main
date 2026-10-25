@@ -520,11 +520,29 @@ db.prepare(`
     return String(customer.resaleTaxNumber || "").trim() ? 0 : Number((subtotal * 0.07).toFixed(2));
   }
 
+  function quotePricing(body) {
+    const preliminary = calculate({ ...body, tax: 0, shipping: 0 });
+    const customer = db.prepare("SELECT * FROM customers WHERE id = ?").get(String(body.customerId || ""));
+    if (!customer) throw new Error("Select an existing customer");
+    const options = getLocalShippingOptions(body.items, customer);
+    const selectedShippingId = String(body.selectedShippingId || "");
+    const chosen = options.find(o => String(o.id) === selectedShippingId);
+    if (!chosen) throw new Error("Select an available shipping option");
+    const shipping = Number(chosen.amount);
+    const tax = quoteTaxForCustomer(body.customerId, preliminary.subtotal);
+    return { ...calculate({ ...body, tax, shipping }), options, chosen };
+  }
+
   router.post("/tax-preview", (req, res) => {
     try {
-      const totals = calculate({ ...req.body, tax: 0 });
-      const tax = quoteTaxForCustomer(req.body.customerId, totals.subtotal);
-      res.json({ subtotal: totals.subtotal, tax, total: Number((totals.subtotal + tax + totals.shipping).toFixed(2)) });
+      const preliminary = calculate({ ...req.body, tax: 0, shipping: 0 });
+      const customer = db.prepare("SELECT * FROM customers WHERE id = ?").get(String(req.body.customerId || ""));
+      if (!customer) throw new Error("Select an existing customer");
+      const options = getLocalShippingOptions(req.body.items, customer);
+      const tax = quoteTaxForCustomer(req.body.customerId, preliminary.subtotal);
+      const chosen = options.find(o => String(o.id) === String(req.body.selectedShippingId || ""));
+      res.json({ subtotal: preliminary.subtotal, tax, options, chosen: chosen || null, shipping: chosen ? Number(chosen.amount) : null,
+        total: chosen ? Number((preliminary.subtotal + tax + Number(chosen.amount)).toFixed(2)) : null });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
@@ -542,9 +560,7 @@ db.prepare(`
         });
       }
 
-      const preliminary = calculate({ ...req.body, tax: 0 });
-      const tax = quoteTaxForCustomer(req.body.customerId, preliminary.subtotal);
-      const totals = calculate({ ...req.body, tax });
+      const totals = quotePricing(req.body);
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
       
