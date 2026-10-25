@@ -855,19 +855,6 @@ function deductInventoryOnceForPaidOrder(db, orderId) {
     return true;
   })();
 }
-// ✅ Stripe anti-duplicados: guardar session.id en la orden
-try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
-// Evitar órdenes duplicadas por el mismo pago de Stripe
-if (!columnExists("orders", "stripePaymentIntentId")) {
-  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
-}
-
-db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
-  ON orders(stripePaymentIntentId)
-  WHERE stripePaymentIntentId IS NOT NULL
-`);
 // =====================================================
 // SHIPPING + TAX SETTINGS
 // =====================================================
@@ -965,6 +952,20 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_customerId ON orders(customerId);
 CREATE INDEX IF NOT EXISTS idx_orders_invoiceId ON orders(invoiceId);
 CREATE INDEX IF NOT EXISTS idx_orders_orderNumber ON orders(orderNumber);
+`);
+
+// ✅ Stripe anti-duplicados: guardar session.id en la orden
+try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
+try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
+// Evitar órdenes duplicadas por el mismo pago de Stripe
+if (!columnExists("orders", "stripePaymentIntentId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
+  ON orders(stripePaymentIntentId)
+  WHERE stripePaymentIntentId IS NOT NULL
 `);
 
 // =====================================================
