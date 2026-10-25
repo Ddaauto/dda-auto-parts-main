@@ -40,6 +40,56 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    if (event.type === "checkout.session.completed" && event.data.object?.metadata?.quoteOrderId) {
+      const session = event.data.object;
+      if (session.payment_status !== "paid") return res.json({ received: true });
+      const meta = session.metadata;
+      const saved = db.transaction(() => {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ? AND quoteId = ?")
+          .get(meta.quoteOrderId, meta.quoteId);
+        if (!order || order.stripeSessionId !== session.id) {
+          throw new Error("Quote payment session does not match its order");
+        }
+        if (order.paymentStatus === "PAID") {
+          if (!order.inventoryDeductedAt) deductInventoryOnceForPaidOrder(db, order.id);
+          return { orderId: order.id, alreadyPaid: true };
+        }
+        if (order.paymentStatus !== "PENDING" || String(order.status).toUpperCase() !== "PENDING") {
+          throw new Error("Quote order is not awaiting payment");
+        }
+        if (Math.round(Number(order.grandTotal) * 100) !== session.amount_total ||
+            String(session.currency).toLowerCase() !== "usd") {
+          throw new Error("Quote checkout total mismatch");
+        }
+        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card' WHERE id = ?").run(order.id);
+        deductInventoryOnceForPaidOrder(db, order.id);
+        return { orderId: order.id, alreadyPaid: false };
+      })();
+      if (!saved.alreadyPaid) {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(saved.orderId);
+        try {
+          const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
+          const email = customer?.email;
+          if (email) {
+            const pdfPath = await generateInvoicePDF(order);
+            await sendEmail({
+              to: email,
+              subject: `Payment confirmed — Invoice ${order.invoiceId} (DDA Auto Parts)`,
+              text: `Payment confirmed for order ${order.orderNumber}. Your invoice is attached.`,
+              attachments: [{
+                content: fs.readFileSync(pdfPath, { encoding: "base64" }),
+                filename: `${order.invoiceId}.pdf`,
+                type: "application/pdf",
+                disposition: "attachment"
+              }]
+            });
+          }
+        } catch (emailError) {
+          console.error("Quote invoice email failed; payment is recorded:", emailError);
+        }
+      }
+      return res.json({ received: true });
+    }
     if (event.type === "checkout.session.completed") {
   const session = event.data.object;
     if (session.payment_status !== "paid") {
@@ -1088,7 +1138,9 @@ if (!columnExists("orders", "inventoryDeductedAt")) {
 }
 app.use("/api/quotes", createQuotesRouter(db, authRequired, {
   makeInvoiceId,
-  nextOrderSeq
+  nextOrderSeq,
+  stripe,
+  getLocalShippingOptions: (items, customer) => computeShippingOptionsAdvanced({ items, customer }).options
 }));
 
 // =====================================================
@@ -3000,6 +3052,12 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Not a Zelle order" });
     }
 
+    if (order.paymentStatus === "PAID") {
+      return res.status(409).json({ ok: false, error: "Payment already confirmed" });
+    }
+    if (order.paymentStatus !== "PENDING_ADMIN" || order.status !== "PENDING") {
+      return res.status(409).json({ ok: false, error: "Order is not awaiting Zelle confirmation" });
+    }
     const nowIso = new Date().toISOString();
     const confirmedBy = String(req.user.email || "");
 
