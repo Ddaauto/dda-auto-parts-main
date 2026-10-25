@@ -16,6 +16,7 @@ export default function QuoteReview() {
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const [paying, setPaying] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -50,12 +51,38 @@ export default function QuoteReview() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Unable to submit decision");
-      setQuote((previous) => ({ ...previous, status: decision }));
+      setQuote((previous) => ({ ...previous, status: decision, orderNumber: data.orderNumber || previous.orderNumber, paymentStatus: "PENDING" }));
       setMessage(decision === "ACCEPTED" ? "Quotation approved. Thank you!" : "Quotation declined.");
     } catch (err) {
       setError(err.message || "Unable to submit decision");
     } finally {
       setWorking(false);
+    }
+  }
+
+  async function selectPayment(method) {
+    if (paying) return;
+    setPaying(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/quotes/public/${token}/payment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ method })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Unable to select payment");
+      if (method === "CARD") {
+        if (!data.url) throw new Error("Checkout URL unavailable");
+        window.location.assign(data.url);
+        return;
+      }
+      setQuote(previous => ({ ...previous, paymentMethod: "Zelle", paymentStatus: "PENDING_ADMIN" }));
+      setMessage("Zelle selected. Your payment will be confirmed by DDA Auto Parts after verification. Please contact DDA Auto Parts for payment instructions.");
+    } catch (err) {
+      setError(err.message || "Unable to select payment");
+    } finally {
+      setPaying(false);
     }
   }
 
@@ -101,7 +128,26 @@ export default function QuoteReview() {
                 <button disabled={working} onClick={() => decide("REJECTED")} style={{ padding: "12px 24px", border: "1px solid #b42318", borderRadius: 8, background: "white", color: "#b42318", cursor: "pointer" }}>Reject Quote</button>
               </div>
             )}
-            {quote.status === "EXPIRED" && <p>This quotation has expired.</p>}
+            {quote.status === "ACCEPTED" && (
+              <section style={{ marginTop: 24 }}>
+                <h3>Payment</h3>
+                {quote.orderNumber && <p><strong>Order:</strong> {quote.orderNumber}</p>}
+                {quote.paymentStatus === "PAID" ? (
+                  <p>Payment confirmed. Thank you!</p>
+                ) : quote.paymentStatus === "PENDING_ADMIN" ? (
+                  <p>Zelle payment is awaiting confirmation by DDA Auto Parts. Contact the store for payment instructions.</p>
+                ) : quote.paymentMethod === "Card" ? (
+                  <button disabled={paying} onClick={() => selectPayment("CARD")}>Continue card payment</button>
+                ) : (
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <button disabled={paying} onClick={() => selectPayment("CARD")} style={{ padding: "12px 24px" }}>Pay by card (Stripe)</button>
+                    {quote.zelleAvailable && <button disabled={paying} onClick={() => selectPayment("ZELLE")} style={{ padding: "12px 24px" }}>Pay with Zelle</button>}
+                  </div>
+                )}
+                <p style={{ fontSize: 13, color: "#526171" }}>Inventory is updated only after payment is confirmed.</p>
+              </section>
+            )}
+            {quote.status === "EXPIRED" && <p>This quotation has expired.</p>
           </>
         )}
       </section>
