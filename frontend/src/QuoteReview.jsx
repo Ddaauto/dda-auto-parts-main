@@ -51,7 +51,9 @@ export default function QuoteReview() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Unable to submit decision");
-      setQuote((previous) => ({ ...previous, status: decision, orderNumber: data.orderNumber || previous.orderNumber, paymentStatus: "PENDING" }));
+      const refreshed = await fetch(`${API}/api/quotes/public/${token}`);
+      const freshData = await refreshed.json().catch(() => ({}));
+      setQuote((previous) => refreshed.ok ? freshData : ({ ...previous, status: decision, orderNumber: data.orderNumber || previous.orderNumber, paymentStatus: "PENDING" }));
       setMessage(decision === "ACCEPTED" ? "Quotation approved. Thank you!" : "Quotation declined.");
     } catch (err) {
       setError(err.message || "Unable to submit decision");
