@@ -5,12 +5,15 @@ import "./App.css";
 import logo from "./assets/logo.jpg";
 import Success from "./Success";
 import Cancel from "./NewCancel";
+import QuoteReview from "./QuoteReview";
 /**
  * =========================
  * CONFIG
  * =========================
  */
 const API = import.meta.env.VITE_API_URL || "http://localhost:5177";
+// Read-only public catalog; checkout and account requests remain on the isolated preview API.
+const CATALOG_API = import.meta.env.VITE_CATALOG_API_URL || API;
 const YEARS = Array.from({ length: 36 }, (_, i) => 2026 - i);
 const OTHER = "__OTHER__";
 
@@ -972,6 +975,7 @@ const resetTokenFromUrl =
 
 if (path === "/success") return <Success />;
 if (path === "/cancel") return <Cancel />;
+  if (path.startsWith("/quote/")) return <QuoteReview />;
 
   // ===== ADMIN ROUTE =====
   if (window.location.pathname === "/admin") return <Admin />;
@@ -1251,7 +1255,7 @@ const [shippingLoading, setShippingLoading] = useState(false);
   useEffect(() => {
   const load = async () => {
     try {
-      const r = await fetch(`${API}/products`);
+      const r = await fetch(`${CATALOG_API}/products`);
       const data = await r.json();
 
       const normalized = (Array.isArray(data) ? data : []).map((p) => ({
@@ -1317,12 +1321,7 @@ const [shippingLoading, setShippingLoading] = useState(false);
     });
   }, [adminProducts, q, makeCanon, modelValue, engineValue, year]);
 
-  const canShowProducts = useMemo(() => {
-  if (norm(q).length > 0) return true;
-  if (categoryFilter) return true;
-  if (makeCanon && modelValue && normalizeEngine(engineValue)) return true;
-  return false;
-}, [q, categoryFilter, makeCanon, modelValue, engineValue]);
+  const canShowProducts = true;
 const visibleProducts = useMemo(() => {
   return filtered.filter(
     (p) =>
@@ -1471,6 +1470,16 @@ setShippingChoice(opts[0]?.id || "");
 
   const openCheckout = async () => {
     if (!cart.length) return;
+    if (!me) {
+      const continueToLogin = window.confirm(
+        "To complete your purchase, please sign in or create an account. Your shopping cart will be saved.\\n\\nPress OK to continue, or Cancel to keep shopping."
+      );
+      if (continueToLogin) {
+        setAuthTab("login");
+        go("/login");
+      }
+      return;
+    }
 
     const c = me?.customer || {};
     // require complete address
@@ -1877,7 +1886,7 @@ if (resetTokenFromUrl) {
     </div>
   );
 }
-  if (!me) {
+  if (!me && (route === "/login" || route === "/register" || route === "/account")) {
     return (
       <div className="container">
         <div className="card" style={{ maxWidth: 720, margin: "20px auto" }}>
@@ -1886,7 +1895,7 @@ if (resetTokenFromUrl) {
             <div>
               <h2 style={{ margin: 0 }}>DDA Auto Parts</h2>
               <div style={{ color: "var(--muted)", marginTop: 4, fontSize: 13 }}>
-                Login required to access the store.
+                Sign in or register to complete your purchase and access your account.
               </div>
             </div>
           </div>
@@ -2014,11 +2023,11 @@ if (resetTokenFromUrl) {
   </div>
 
   <div className="pills">
-    <button className="btn" onClick={() => go("/account")}>
-      My Account
+    <button className="btn" onClick={() => { setAuthTab("login"); go(me ? "/account" : "/login"); }}>
+      {me ? "My Account" : "Login / Register"}
     </button>
 
-    <button
+    {me && <button
       className="btn"
       onClick={() => {
         setToken("");
@@ -2027,7 +2036,7 @@ if (resetTokenFromUrl) {
       }}
     >
       Logout
-    </button>
+    </button>}
 
     
     <button className="btn" onClick={() => setCartOpen(true)}>
@@ -2606,7 +2615,7 @@ if (resetTokenFromUrl) {
           </div>
         ) : !canShowProducts ? (
           <div className="card" style={{ color: "var(--muted)" }}>
-            Search by part number or select Year, Make and Model to find compatible parts.
+            Browse all available products, or search by part number or vehicle.
           </div>
         ) : filtered.length === 0 ? (
           <div className="card" style={{ color: "var(--muted)" }}>
@@ -2699,7 +2708,7 @@ if (resetTokenFromUrl) {
     <div style={{ fontWeight: 900, marginBottom: 6 }}>Zelle info</div>
     <div>Email: <b>ddaautoparts@gmail.com</b></div>
     <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 13 }}>
-      Confirmación manual. Incluye tu número de orden en la nota de Zelle.
+      Payment requires manual confirmation. Include your order number in the Zelle payment memo.
     </div>
   </div>
 )}
