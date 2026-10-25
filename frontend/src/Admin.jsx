@@ -59,6 +59,16 @@ export default function Admin() {
   const [loginErr, setLoginErr] = useState("");
 
   const [adminTab, setAdminTab] = useState("products");
+  
+const [quotes, setQuotes] = useState([]);
+const [quotesLoading, setQuotesLoading] = useState(false);
+const [quoteCustomerName, setQuoteCustomerName] = useState("");
+const [quoteCustomerEmail, setQuoteCustomerEmail] = useState("");
+const [quoteItems, setQuoteItems] = useState([]);
+const [quoteNotes, setQuoteNotes] = useState("");
+const [quoteTax, setQuoteTax] = useState(0);
+const [quoteShipping, setQuoteShipping] = useState(0);
+
   const [customers, setCustomers] = useState([]);
   const [customerSearch, setCustomerSearch] = useState("");
   const [customersLoading, setCustomersLoading] = useState(false);
@@ -616,6 +626,33 @@ async function loadOrders() {
     setOrdersLoading(false);
   }
 }
+  
+async function loadQuotes() {
+  setQuotesLoading(true);
+
+  try {
+    const token = localStorage.getItem("token");
+
+    const res = await fetch(`${API}/api/quotes`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.error || "Failed to load quotes");
+    }
+
+    setQuotes(Array.isArray(data) ? data : []);
+  } catch (err) {
+    alert(err.message || "Could not load quotes");
+  } finally {
+    setQuotesLoading(false);
+  }
+}
+
 async function cancelOrder(id) {
   if (!window.confirm("Cancel this order?")) return;
 
@@ -1071,7 +1108,18 @@ alert("CSV imported successfully");
 >
   Create Order
 </button>
-   
+ 
+<button
+  className="btn"
+  style={{ marginLeft: 10 }}
+  onClick={() => {
+  setAdminTab("quotes");
+  loadQuotes();
+}}
+>
+  Quotes
+</button>
+  
 <button
   className="btn"
   style={{
@@ -1417,6 +1465,354 @@ alert("CSV imported successfully");
     <AdminZellePending onCount={(n) => setZellePendingCount(n)} />
   </div>
 )}
+ 
+{/* =========================
+    QUOTES TAB
+========================= */}
+{adminTab === "quotes" && (
+  <div className="card" style={{ marginTop: 16 }}>
+    <h2>Quotes</h2>
+    
+<div style={{ display: "grid", gap: 10, marginBottom: 20 }}>
+  <h3>Create New Quote</h3>
+
+  <input
+    className="input"
+    placeholder="Customer name"
+    value={quoteCustomerName}
+    onChange={(e) => setQuoteCustomerName(e.target.value)}
+  />
+
+  <input
+    className="input"
+    type="email"
+    placeholder="Customer email"
+    value={quoteCustomerEmail}
+    onChange={(e) => setQuoteCustomerEmail(e.target.value)}
+  />
+  
+<div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+  <select
+    className="input"
+    value={pickSku}
+    onChange={(e) => setPickSku(e.target.value)}
+    style={{ flex: 1 }}
+  >
+    <option value="">Select product...</option>
+    {products.map((p) => (
+      <option key={p.id || p.sku} value={p.sku}>
+        {p.sku} - {p.name}
+      </option>
+    ))}
+  </select>
+
+  <input
+    className="input"
+    type="number"
+    min="1"
+    value={pickQty}
+    onChange={(e) => setPickQty(Number(e.target.value))}
+    style={{ width: 100 }}
+  />
+</div>
+
+<button
+  className="btn"
+  type="button"
+  onClick={() => {
+    const product = products.find(
+      (p) => String(p.sku) === String(pickSku)
+    );
+
+    const qty = Number(pickQty);
+
+    if (!product) return alert("Select a product first");
+    if (!Number.isInteger(qty) || qty < 1) {
+      return alert("Enter a valid quantity");
+    }
+
+    setQuoteItems((prev) => [
+      ...prev,
+      {
+        sku: product.sku,
+        name: product.name,
+        qty,
+        price: Number(product.price || 0),
+      },
+    ]);
+
+    setPickSku("");
+    setPickQty(1);
+  }}
+>
+  + Add to Quote
+</button>
+
+{quoteItems.length > 0 && (
+  <div style={{ marginTop: 15 }}>
+    <h3>Quote Items</h3>
+
+    {quoteItems.map((item, index) => (
+      <div
+        key={index}
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          marginBottom: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ flex: 1 }}>
+          {item.name} — {item.qty} x ${item.price.toFixed(2)}
+        </span>
+
+        <strong>
+          ${(item.qty * item.price).toFixed(2)}
+        </strong>
+
+        <button
+          className="btn"
+          type="button"
+          onClick={() =>
+            setQuoteItems((prev) =>
+              prev.filter((_, i) => i !== index)
+            )
+          }
+        >
+          Remove
+        </button>
+      </div>
+    ))}
+
+    <h3>
+      Subtotal: $
+      {quoteItems
+        .reduce((sum, item) => sum + item.qty * item.price, 0)
+        .toFixed(2)}
+    </h3>
+  </div>
+)}
+
+<div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+  <label>
+    Tax ($)
+    <input
+      className="input"
+      type="number"
+      min="0"
+      step="0.01"
+      value={quoteTax}
+      onChange={(e) => setQuoteTax(e.target.value)}
+    />
+  </label>
+
+  <label>
+    Shipping ($)
+    <input
+      className="input"
+      type="number"
+      min="0"
+      step="0.01"
+      value={quoteShipping}
+      onChange={(e) => setQuoteShipping(e.target.value)}
+    />
+  </label>
+</div>
+
+<h3>
+  Quote Total: $
+  {(
+    quoteItems.reduce(
+      (sum, item) => sum + item.qty * item.price,
+      0
+    ) +
+    Number(quoteTax || 0) +
+    Number(quoteShipping || 0)
+  ).toFixed(2)}
+</h3>
+
+<label>
+  Notes
+  <textarea
+    className="input"
+    rows={3}
+    placeholder="Additional information or special conditions..."
+    value={quoteNotes}
+    onChange={(e) => setQuoteNotes(e.target.value)}
+    style={{ width: "100%" }}
+  />
+</label>
+
+<button
+  className="btn btnPrimary"
+  type="button"
+  onClick={async () => {
+    if (!quoteCustomerName.trim()) {
+      return alert("Enter customer name");
+    }
+
+    if (quoteItems.length === 0) {
+      return alert("Add at least one product");
+    }
+
+    try {
+      const token = localStorage.getItem("token");
+
+      const res = await fetch(`${API}/api/quotes`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          customerName: quoteCustomerName.trim(),
+          customerEmail: quoteCustomerEmail.trim(),
+          items: quoteItems,
+          tax: Number(quoteTax),
+          shipping: Number(quoteShipping),
+          notes: quoteNotes,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to save quote");
+      }
+
+      alert(`Quote ${data.quoteNumber} saved successfully`);
+
+      setQuoteCustomerName("");
+      setQuoteCustomerEmail("");
+      setQuoteItems([]);
+      setQuoteTax(0);
+      setQuoteShipping(0);
+      setQuoteNotes("");
+
+      await loadQuotes();
+    } catch (err) {
+      alert(err.message || "Could not save quote");
+    }
+  }}
+>
+  Save Quote
+</button>
+
+</div>
+
+{quotesLoading ? (
+  <p>Loading quotes...</p>
+) : quotes.length === 0 ? (
+  <p>No quotes found.</p>
+) : (
+  <div style={{ overflowX: "auto" }}>
+    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+      <thead>
+        <tr>
+          <th>Quote #</th>
+          <th>Customer</th>
+          <th>Email</th>
+          <th>Total</th>
+          <th>Status</th>
+          <th>Date</th>
+         <th>Actions</th> 
+        </tr>
+      </thead>
+      <tbody>
+        {quotes.map((q) => (
+          <tr key={q.id}>
+            <td>{q.quoteNumber}</td>
+            <td>{q.customerName}</td>
+            <td>{q.customerEmail}</td>
+            <td>${Number(q.total || 0).toFixed(2)}</td>
+            <td>{q.status}</td>
+            <td>{q.createdAt?.slice(0, 10)}</td>
+            <td>
+  {q.status === "DRAFT" && (
+    <button
+      type="button"
+      className="btn btnPrimary"
+      onClick={async () => {
+        if (!window.confirm(`Send quote ${q.quoteNumber} to ${q.customerEmail}?`)) return;
+
+        try {
+          const token = localStorage.getItem("token") || "";
+          const res = await fetch(
+           `${API}/api/quotes/${q.id}/send`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            }
+          );
+
+          const data = await res.json();
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || "Failed to send quote");
+          }
+
+          alert("Quote sent successfully!");
+          window.location.reload();
+        } catch (err) {
+          alert(err.message || "Error sending quote");
+        }
+      }}
+    >
+      Send Quote
+    </button>
+  )}
+  {q.status === "ACCEPTED" && (
+    <button
+      type="button"
+      className="btn btnPrimary"
+      onClick={async () => {
+        if (!window.confirm(
+          `Convert quote ${q.quoteNumber} into a PENDING order? Inventory will be deducted.`
+        )) return;
+
+        try {
+          const token = localStorage.getItem("token") || "";
+
+          const res = await fetch(
+            `${API}/admin/quotes/${q.id}/convert`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            }
+          );
+
+          const data = await res.json();
+
+          if (!res.ok || !data.ok) {
+            throw new Error(data.error || "Conversion failed");
+          }
+
+          alert(`Order ${data.orderNumber} created successfully!`);
+          await loadQuotes();
+
+        } catch (err) {
+          alert(err.message || "Error converting quote");
+        }
+      }}
+    >
+      Convert to Order
+    </button>
+  )}              
+</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+)}
+
+  </div>
+)}
+     
 {/* =========================
     CREATE ORDER TAB
 ========================= */}
