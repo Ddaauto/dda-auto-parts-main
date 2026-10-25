@@ -226,7 +226,7 @@ const fullProducts = await Promise.all(
       vehicleLabel, vin, year, make, model, engine, trim,
     customerSnapshot, itemsJson, status, stripeSessionId
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     orderId,
     invoiceId,
@@ -258,10 +258,12 @@ JSON.stringify(cleanItems),
 session.id
 );
   deductInventoryOnceForPaidOrder(db, orderId);
+  return orderId;
 });
 
-saveWebhookOrder();
-  console.log("✅ Order created:", orderNumber, invoiceId);
+const orderId = saveWebhookOrder();
+const createdOrder = db.prepare("SELECT orderNumber, invoiceId FROM orders WHERE id = ?").get(orderId);
+console.log("✅ Order created:", createdOrder.orderNumber, createdOrder.invoiceId);
   console.log("🚀 Starting email block...");
 console.log("📧 customerEmail metadata:", customerEmail);
 
