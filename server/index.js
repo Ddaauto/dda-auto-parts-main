@@ -12,10 +12,9 @@ import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
 import stripeRoutes from "./routes/stripe.js";
-
+import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
-
 
 const app = express();
 // ================================
@@ -41,8 +40,70 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    if (event.type === "checkout.session.completed" && event.data.object?.metadata?.quoteOrderId) {
+      const session = event.data.object;
+      if (session.payment_status !== "paid") return res.json({ received: true });
+      const meta = session.metadata;
+      const saved = db.transaction(() => {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ? AND quoteId = ?")
+          .get(meta.quoteOrderId, meta.quoteId);
+        if (!order || order.stripeSessionId !== session.id) {
+          throw new Error("Quote payment session does not match its order");
+        }
+        if (order.paymentStatus === "PAID") {
+          if (!order.inventoryDeductedAt) deductInventoryOnceForPaidOrder(db, order.id);
+          return { orderId: order.id, alreadyPaid: true };
+        }
+        if (order.paymentStatus !== "PENDING" || String(order.status).toUpperCase() !== "PENDING") {
+          throw new Error("Quote order is not awaiting payment");
+        }
+        if (Math.round(Number(order.grandTotal) * 100) !== session.amount_total ||
+            String(session.currency).toLowerCase() !== "usd") {
+          throw new Error("Quote checkout total mismatch");
+        }
+        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card' WHERE id = ?").run(order.id);
+        deductInventoryOnceForPaidOrder(db, order.id);
+        return { orderId: order.id, alreadyPaid: false };
+      })();
+      if (!saved.alreadyPaid) {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(saved.orderId);
+        try {
+          const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
+          const email = customer?.email;
+          if (email) {
+            const pdfPath = await generateInvoicePDF(order);
+            await sendEmail({
+              to: email,
+              subject: `Payment confirmed — Invoice ${order.invoiceId} (DDA Auto Parts)`,
+              text: `Payment confirmed for order ${order.orderNumber}. Your invoice is attached.`,
+              attachments: [{
+                content: fs.readFileSync(pdfPath, { encoding: "base64" }),
+                filename: `${order.invoiceId}.pdf`,
+                type: "application/pdf",
+                disposition: "attachment"
+              }]
+            });
+          }
+        } catch (emailError) {
+          console.error("Quote invoice email failed; payment is recorded:", emailError);
+        }
+      }
+      return res.json({ received: true });
+    }
     if (event.type === "checkout.session.completed") {
   const session = event.data.object;
+    if (session.payment_status !== "paid") {
+  console.log("Stripe session not paid:", session.id);
+  return res.json({ received: true });
+}  
+      const existingOrder = db.prepare(
+  "SELECT id FROM orders WHERE stripeSessionId = ?"
+).get(session.id);
+
+if (existingOrder) {
+  console.log("Stripe session already processed:", session.id);
+  return res.json({ received: true });
+}
   const meta = session?.metadata || {};
 
   console.log("✅ checkout.session.completed:", session.id, "metadata:", meta);
@@ -83,24 +144,48 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     console.error("❌ No line_items found on session:", session.id);
     return res.json({ received: true });
   }
+const fullProducts = await Promise.all(
+  li.map(async (x) => {
+    const productId = x?.price?.product;
 
+    if (!productId) {
+      throw new Error("Stripe product ID missing");
+    }
+
+    return stripeWebhook.products.retrieve(
+      typeof productId === "string" ? productId : productId.id
+    );
+  })
+);
   const cleanItems = li.map((x, idx) => {
-    const name = String(x?.description || `Item ${idx + 1}`);
-    const qty = Math.max(1, Number(x?.quantity || 1));
-    const unitCents = Number(x?.price?.unit_amount || 0);
-    const price = Number((unitCents / 100).toFixed(2));
+  const name = String(x?.description || `Item ${idx + 1}`);
+  const qty = Number(x?.quantity);
+  const unitCents = Number(x?.price?.unit_amount || 0);
+  const price = Number((unitCents / 100).toFixed(2));
 
-    return {
-      id: `stripe_${idx + 1}`,
-      name,
-      sku: "",
-      mpn: "",
-      brand: "",
-      price,
-      qty,
-      weightLb: 1,
-    };
-  });
+  const sku = String(
+    fullProducts[idx]?.metadata?.sku || ""
+  ).trim();
+
+  if (!sku) {
+    throw new Error(`Missing SKU for ${name}`);
+  }
+
+  if (!Number.isSafeInteger(qty) || qty <= 0) {
+    throw new Error(`Invalid quantity for SKU ${sku}`);
+  }
+
+  return {
+    id: `stripe_${idx + 1}`,
+    name,
+    sku,
+    mpn: "",
+    brand: "",
+    price,
+    qty,
+    weightLb: 1,
+  };
+});
 
   // 3) Totales y shipping usando tu misma lógica
   const subtotal = Number(
@@ -122,6 +207,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   const grandTotal = Number((subtotal + taxNum + shippingNum - discounts).toFixed(2));
 
   // 4) Crear orden PAID/Card
+      const saveWebhookOrder = db.transaction(() => {
   const orderId = uid("ord");
   const invoiceId = makeInvoiceId();
   const seq = nextOrderSeq();
@@ -138,9 +224,9 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       shippingCarrier, shippingService, shippingEta,
       shippingMethod, shippingIsEstimated, shippingMeta,
       vehicleLabel, vin, year, make, model, engine, trim,
-      customerSnapshot, itemsJson, status
+    customerSnapshot, itemsJson, status, stripeSessionId
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     orderId,
     invoiceId,
@@ -166,12 +252,18 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
     vehicleLabel,
     String(vehicle.vin || ""),
     "", "", "", "", "", 
-    JSON.stringify(customer),
-    JSON.stringify(cleanItems),
-    "PAID"
-  );
+   JSON.stringify(customer),
+JSON.stringify(cleanItems),
+"PAID",
+session.id
+);
+  deductInventoryOnceForPaidOrder(db, orderId);
+  return orderId;
+});
 
-  console.log("✅ Order created:", orderNumber, invoiceId);
+const orderId = saveWebhookOrder();
+const createdOrder = db.prepare("SELECT orderNumber, invoiceId FROM orders WHERE id = ?").get(orderId);
+console.log("✅ Order created:", createdOrder.orderNumber, createdOrder.invoiceId);
   console.log("🚀 Starting email block...");
 console.log("📧 customerEmail metadata:", customerEmail);
 
@@ -345,7 +437,13 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
     if (pi.status !== "succeeded") {
       return res.status(400).json({ ok: false, error: "Payment not completed" });
     }
+const existingOrder = db.prepare(
+  "SELECT * FROM orders WHERE stripePaymentIntentId = ?"
+).get(pi.id);
 
+if (existingOrder) {
+  return res.json({ ok: true, order: existingOrder });
+}
     const customer = db
       .prepare("SELECT * FROM customers WHERE id = ?")
       .get(req.user.customerId);
@@ -381,16 +479,16 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
     const invoiceId = makeInvoiceId();
     const seq = nextOrderSeq();
     const orderNumber = `ORD-${String(seq).padStart(6, "0")}`;
-
+const savePaidOrder = db.transaction(() => {
     db.prepare(`
       INSERT INTO orders (
         id, invoiceId, orderNumber, orderSeq,
         customerId, createdAt, paymentMethod, paymentStatus,
         subtotal, tax, shipping, grandTotal,
         shippingMethod,
-        customerSnapshot, itemsJson, status
+        customerSnapshot, itemsJson, status, stripePaymentIntentId
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       orderId,
       invoiceId,
@@ -406,10 +504,14 @@ app.post("/stripe/confirm-payment", authRequired, async (req, res) => {
       grandTotal,
       chosen.id,
       JSON.stringify(customer),
-      JSON.stringify(cleanItems),
-      "PAID"
-    );
+JSON.stringify(cleanItems),
+"PAID",
+pi.id
+);
+    deductInventoryOnceForPaidOrder(db, orderId);
+});
 
+savePaidOrder();
     const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
 
     const pdfPath = await generateInvoicePDF(order);
@@ -679,39 +781,84 @@ function qtyInt(n) {
 }
 
 function reserveInventoryOrThrow(db, items) {
-  const getStock = db.prepare(`SELECT sku, stock FROM products WHERE sku = ?`);
-  const decStock = db.prepare(`UPDATE products SET stock = stock - ? WHERE sku = ?`);
+  const quantities = new Map();
 
+  // Agrupar cantidades por SKU
   for (const it of items) {
     const sku = String(it.sku || "").trim();
-    const qty = Math.floor(Number(it.qty || 0));
+    const qty = Number(it.qty);
 
     if (!sku) throw new Error("Item missing SKU");
-    if (qty <= 0) throw new Error(`Invalid qty for SKU ${sku}`);
+    if (!Number.isSafeInteger(qty) || qty <= 0) {
+      throw new Error(`Invalid qty for SKU ${sku}`);
+    }
 
+    quantities.set(sku, (quantities.get(sku) || 0) + qty);
+  }
+
+  const getStock = db.prepare(
+    "SELECT stock FROM products WHERE sku = ?"
+  );
+
+  const decStock = db.prepare(
+    "UPDATE products SET stock = stock - ? WHERE sku = ?"
+  );
+
+  // Verificar todas las cantidades antes de descontar
+  for (const [sku, qty] of quantities) {
     const row = getStock.get(sku);
+
     if (!row) throw new Error(`SKU not found: ${sku}`);
 
     const stock = Number(row.stock || 0);
+
     if (stock < qty) {
-      throw new Error(`Not enough stock for ${sku}. Have ${stock}, need ${qty}`);
+      throw new Error(
+        `Not enough stock for ${sku}. Have ${stock}, need ${qty}`
+      );
     }
   }
 
-  for (const it of items) {
-    const sku = String(it.sku || "").trim();
-    const qty = Math.floor(Number(it.qty || 0));
+  // Descontar inventario
+  for (const [sku, qty] of quantities) {
     decStock.run(qty, sku);
   }
 }
-// ✅ Stripe anti-duplicados: guardar session.id en la orden
-try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
+function deductInventoryOnceForPaidOrder(db, orderId) {
+  return db.transaction(() => {
+    const order = db.prepare(
+      "SELECT * FROM orders WHERE id = ?"
+    ).get(orderId);
 
+    if (!order) throw new Error("Order not found");
+
+    if (order.inventoryDeductedAt) {
+      return false;
+    }
+
+    if (String(order.paymentStatus).toUpperCase() !== "PAID") {
+      throw new Error("Payment is not confirmed");
+    }
+
+    const items = JSON.parse(order.itemsJson || "[]");
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("Order has no items");
+    }
+
+    reserveInventoryOrThrow(db, items);
+
+    db.prepare(
+      "UPDATE orders SET inventoryDeductedAt = ? WHERE id = ?"
+    ).run(new Date().toISOString(), orderId);
+
+    return true;
+  })();
+}
 // =====================================================
 // SHIPPING + TAX SETTINGS
 // =====================================================
-const ORIGIN_ZIP = "33010";
+const ORIGIN_ZIP = "33018";
 const UBER_MAX_MILES = 20;
 
 // =====================================================
@@ -805,6 +952,20 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_customerId ON orders(customerId);
 CREATE INDEX IF NOT EXISTS idx_orders_invoiceId ON orders(invoiceId);
 CREATE INDEX IF NOT EXISTS idx_orders_orderNumber ON orders(orderNumber);
+`);
+
+// ✅ Stripe anti-duplicados: guardar session.id en la orden
+try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
+try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
+// Evitar órdenes duplicadas por el mismo pago de Stripe
+if (!columnExists("orders", "stripePaymentIntentId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
+  ON orders(stripePaymentIntentId)
+  WHERE stripePaymentIntentId IS NOT NULL
 `);
 
 // =====================================================
@@ -929,6 +1090,16 @@ CREATE TABLE IF NOT EXISTS zip_geo (
 );
 `);
 
+// Preview-only ZIP coordinates from the uploaded uszips.csv.
+// Seed on boot because the test database starts without the ZIP import.
+if (process.env.NODE_ENV === "test") {
+  const insertPreviewZip = db.prepare(
+    "INSERT OR IGNORE INTO zip_geo (zip, lat, lon) VALUES (?, ?, ?)"
+  );
+  insertPreviewZip.run("33010", 25.83309, -80.27902);
+  insertPreviewZip.run("33018", 25.92, -80.39274);
+}
+
 // =====================================================
 // HELPERS
 // =====================================================
@@ -963,6 +1134,27 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+// Relacionar cada orden con su cotización original
+if (!columnExists("orders", "quoteId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN quoteId INTEGER");
+}
+
+// Impedir convertir una cotización dos veces
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_quoteId
+  ON orders(quoteId)
+  WHERE quoteId IS NOT NULL
+`);
+// Control para evitar descontar inventario dos veces
+if (!columnExists("orders", "inventoryDeductedAt")) {
+  db.exec("ALTER TABLE orders ADD COLUMN inventoryDeductedAt TEXT");
+}
+app.use("/api/quotes", createQuotesRouter(db, authRequired, {
+  makeInvoiceId,
+  nextOrderSeq,
+  stripe,
+  getLocalShippingOptions: (items, customer) => computeShippingOptionsAdvanced({ items, customer }).options
+}));
 
 
 
@@ -1273,6 +1465,10 @@ app.post("/auth/forgot-password", async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     }
 
+    if (process.env.NODE_ENV === "test") {
+      return res.status(503).json({ error: "Password reset emails are disabled on this preview server. No reset email was sent." });
+    }
+
     const customer = db.prepare(`
       SELECT id, email, firstName, lastName
       FROM customers
@@ -1296,7 +1492,7 @@ db.prepare(`
   SET resetToken = ?, resetTokenExpiresAt = ?
   WHERE email = ?
 `).run(token, expiresAt, customer.email);
-    const resetLink = `http://localhost:5173/?reset_token=${encodeURIComponent(token)}`;
+    const resetLink = `${String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "")}/?reset_token=${encodeURIComponent(token)}`;
 
     const fullName =
       [customer.firstName, customer.lastName].filter(Boolean).join(" ").trim() || "Customer";
@@ -2761,8 +2957,7 @@ app.post("/admin/orders/create", authRequired, (req, res) => {
 
     // ✅ TRANSACTION
     const tx = db.transaction(() => {
-      // 1️⃣ Verify + decrement inventory
-      reserveInventoryOrThrow(db, cleanItems);
+      
 
       // 2️⃣ Insert order
       insertOrder.run(
@@ -2876,17 +3071,29 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Not a Zelle order" });
     }
 
+    if (order.paymentStatus === "PAID") {
+      return res.status(409).json({ ok: false, error: "Payment already confirmed" });
+    }
+    if (order.paymentStatus !== "PENDING_ADMIN" || order.status !== "PENDING") {
+      return res.status(409).json({ ok: false, error: "Order is not awaiting Zelle confirmation" });
+    }
     const nowIso = new Date().toISOString();
     const confirmedBy = String(req.user.email || "");
 
-    db.prepare(`
-      UPDATE orders
-      SET paymentStatus = 'PAID',
-          status = 'PAID',
-          confirmedBy = ?,
-          confirmedAt = ?
-      WHERE id = ?
-    `).run(confirmedBy, nowIso, id);
+    const confirmPayment = db.transaction(() => {
+  db.prepare(`
+    UPDATE orders
+    SET paymentStatus = 'PAID',
+        status = 'PAID',
+        confirmedBy = ?,
+        confirmedAt = ?
+    WHERE id = ?
+  `).run(confirmedBy, nowIso, id);
+
+  deductInventoryOnceForPaidOrder(db, id);
+});
+
+confirmPayment();
 
     const updated = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(id);
 
@@ -3052,7 +3259,7 @@ app.post("/admin/orders/preview", authRequired, (req, res) => {
   }
 });
 // ===== ADMIN: CREAR ORDEN PARA UN CLIENTE =====
-app.post("/admin/orders/create", authRequired, (req, res) => {
+app.post("/admin/orders/create-legacy", authRequired, (req, res) => {
   if (req.user.role !== "admin") {
     return res.status(403).json({ ok: false, error: "Admin only" });
   }
@@ -3065,8 +3272,7 @@ app.post("/admin/orders/create", authRequired, (req, res) => {
       paymentMethod = "Zelle", // Admin puede elegir
       vehicle = {},
       selectedShippingId = "",
-      // opcional: si quieres crear ya como pagada (por ejemplo pago tomado por teléfono)
-      paymentStatusOverride = "",
+      
     } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {

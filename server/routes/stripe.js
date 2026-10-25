@@ -1,3 +1,4 @@
+
 // server/routes/stripe.js
 import express from "express";
 import Stripe from "stripe";
@@ -16,22 +17,47 @@ router.get("/stripe/ping", (req, res) => {
 // Create Checkout Session (NO orderId)
 router.post("/stripe/create-checkout-session", async (req, res) => {
   try {
-    const { items, selectedShippingId, vehicle, customerEmail } = req.body || {};
-
+    const {
+      items,
+      selectedShippingId,
+      vehicle,
+      customerEmail,
+    } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Missing items" });
     }
+
     if (!selectedShippingId) {
-      return res.status(400).json({ error: "Missing selectedShippingId" });
+      return res.status(400).json({
+        error: "Missing selectedShippingId",
+      });
     }
 
     const line_items = items.map((i) => {
-      const qty = Math.max(1, Number(i.qty || 1));
-      const unit_amount = Math.round(Number(i.price || 0) * 100);
+      const sku = String(i.sku || "").trim();
+      const qty = Number(i.qty);
+      const unit_amount = Math.round(Number(i.price) * 100);
 
-      if (!Number.isFinite(unit_amount) || unit_amount <= 0) {
-        throw new Error(`Invalid item price for ${i?.name || "item"}`);
+      if (!sku) {
+        throw new Error(
+          `Missing SKU for ${i?.name || "item"}`
+        );
+      }
+
+      if (!Number.isSafeInteger(qty) || qty <= 0) {
+        throw new Error(
+          `Invalid quantity for SKU ${sku}`
+        );
+      }
+
+      if (
+        !Number.isSafeInteger(unit_amount) ||
+        unit_amount <= 0
+      ) {
+        throw new Error(
+          `Invalid item price for SKU ${sku}`
+        );
       }
 
       return {
@@ -41,6 +67,9 @@ router.post("/stripe/create-checkout-session", async (req, res) => {
           unit_amount,
           product_data: {
             name: String(i.name || "Item"),
+            metadata: {
+              sku,
+            },
           },
         },
       };
@@ -57,17 +86,23 @@ router.post("/stripe/create-checkout-session", async (req, res) => {
         process.env.STRIPE_CANCEL_URL ||
         "http://localhost:5173/checkout",
       metadata: {
-  selectedShippingId: String(selectedShippingId),
-  vehicleLabel: String(vehicle?.label || ""),
-  vehicleVin: String(vehicle?.vin || ""),
-  customerEmail: String(customerEmail || ""),
-},
+        selectedShippingId: String(selectedShippingId),
+        vehicleLabel: String(vehicle?.label || ""),
+        vehicleVin: String(vehicle?.vin || ""),
+        customerEmail: String(customerEmail || ""),
+      },
     });
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error("Stripe create-checkout-session error:", err);
-    return res.status(500).json({ error: err?.message || "Stripe error" });
+    console.error(
+      "Stripe create-checkout-session error:",
+      err
+    );
+
+    return res.status(500).json({
+      error: err?.message || "Stripe error",
+    });
   }
 });
 
