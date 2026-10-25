@@ -3193,8 +3193,7 @@ app.post("/admin/orders/create", authRequired, (req, res) => {
       paymentMethod = "Zelle", // Admin puede elegir
       vehicle = {},
       selectedShippingId = "",
-      // opcional: si quieres crear ya como pagada (por ejemplo pago tomado por teléfono)
-      paymentStatusOverride = "",
+      
     } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
