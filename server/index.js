@@ -3179,7 +3179,7 @@ app.post("/admin/orders/preview", authRequired, (req, res) => {
   }
 });
 // ===== ADMIN: CREAR ORDEN PARA UN CLIENTE =====
-app.post("/admin/orders/create", authRequired, (req, res) => {
+app.post("/admin/orders/create-legacy", authRequired, (req, res) => {
   if (req.user.role !== "admin") {
     return res.status(403).json({ ok: false, error: "Admin only" });
   }
