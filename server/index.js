@@ -40,6 +40,56 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    if (event.type === "checkout.session.completed" && event.data.object?.metadata?.quoteOrderId) {
+      const session = event.data.object;
+      if (session.payment_status !== "paid") return res.json({ received: true });
+      const meta = session.metadata;
+      const saved = db.transaction(() => {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ? AND quoteId = ?")
+          .get(meta.quoteOrderId, meta.quoteId);
+        if (!order || order.stripeSessionId !== session.id) {
+          throw new Error("Quote payment session does not match its order");
+        }
+        if (order.paymentStatus === "PAID") {
+          if (!order.inventoryDeductedAt) deductInventoryOnceForPaidOrder(db, order.id);
+          return { orderId: order.id, alreadyPaid: true };
+        }
+        if (order.paymentStatus !== "PENDING" || String(order.status).toUpperCase() !== "PENDING") {
+          throw new Error("Quote order is not awaiting payment");
+        }
+        if (Math.round(Number(order.grandTotal) * 100) !== session.amount_total ||
+            String(session.currency).toLowerCase() !== "usd") {
+          throw new Error("Quote checkout total mismatch");
+        }
+        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card' WHERE id = ?").run(order.id);
+        deductInventoryOnceForPaidOrder(db, order.id);
+        return { orderId: order.id, alreadyPaid: false };
+      })();
+      if (!saved.alreadyPaid) {
+        const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(saved.orderId);
+        try {
+          const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
+          const email = customer?.email;
+          if (email) {
+            const pdfPath = await generateInvoicePDF(order);
+            await sendEmail({
+              to: email,
+              subject: `Payment confirmed — Invoice ${order.invoiceId} (DDA Auto Parts)`,
+              text: `Payment confirmed for order ${order.orderNumber}. Your invoice is attached.`,
+              attachments: [{
+                content: fs.readFileSync(pdfPath, { encoding: "base64" }),
+                filename: `${order.invoiceId}.pdf`,
+                type: "application/pdf",
+                disposition: "attachment"
+              }]
+            });
+          }
+        } catch (emailError) {
+          console.error("Quote invoice email failed; payment is recorded:", emailError);
+        }
+      }
+      return res.json({ received: true });
+    }
     if (event.type === "checkout.session.completed") {
   const session = event.data.object;
     if (session.payment_status !== "paid") {
@@ -176,7 +226,7 @@ const fullProducts = await Promise.all(
       vehicleLabel, vin, year, make, model, engine, trim,
     customerSnapshot, itemsJson, status, stripeSessionId
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     orderId,
     invoiceId,
@@ -208,10 +258,12 @@ JSON.stringify(cleanItems),
 session.id
 );
   deductInventoryOnceForPaidOrder(db, orderId);
+  return orderId;
 });
 
-saveWebhookOrder();
-  console.log("✅ Order created:", orderNumber, invoiceId);
+const orderId = saveWebhookOrder();
+const createdOrder = db.prepare("SELECT orderNumber, invoiceId FROM orders WHERE id = ?").get(orderId);
+console.log("✅ Order created:", createdOrder.orderNumber, createdOrder.invoiceId);
   console.log("🚀 Starting email block...");
 console.log("📧 customerEmail metadata:", customerEmail);
 
@@ -803,23 +855,10 @@ function deductInventoryOnceForPaidOrder(db, orderId) {
     return true;
   })();
 }
-// ✅ Stripe anti-duplicados: guardar session.id en la orden
-try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
-// Evitar órdenes duplicadas por el mismo pago de Stripe
-if (!columnExists("orders", "stripePaymentIntentId")) {
-  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
-}
-
-db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
-  ON orders(stripePaymentIntentId)
-  WHERE stripePaymentIntentId IS NOT NULL
-`);
 // =====================================================
 // SHIPPING + TAX SETTINGS
 // =====================================================
-const ORIGIN_ZIP = "33010";
+const ORIGIN_ZIP = "33018";
 const UBER_MAX_MILES = 20;
 
 // =====================================================
@@ -913,6 +952,20 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_customerId ON orders(customerId);
 CREATE INDEX IF NOT EXISTS idx_orders_invoiceId ON orders(invoiceId);
 CREATE INDEX IF NOT EXISTS idx_orders_orderNumber ON orders(orderNumber);
+`);
+
+// ✅ Stripe anti-duplicados: guardar session.id en la orden
+try { db.exec(`ALTER TABLE orders ADD COLUMN stripeSessionId TEXT;`); } catch {}
+try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripeSessionId ON orders(stripeSessionId);`); } catch {}
+// Evitar órdenes duplicadas por el mismo pago de Stripe
+if (!columnExists("orders", "stripePaymentIntentId")) {
+  db.exec("ALTER TABLE orders ADD COLUMN stripePaymentIntentId TEXT");
+}
+
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
+  ON orders(stripePaymentIntentId)
+  WHERE stripePaymentIntentId IS NOT NULL
 `);
 
 // =====================================================
@@ -1037,6 +1090,16 @@ CREATE TABLE IF NOT EXISTS zip_geo (
 );
 `);
 
+// Preview-only ZIP coordinates from the uploaded uszips.csv.
+// Seed on boot because the test database starts without the ZIP import.
+if (process.env.NODE_ENV === "test") {
+  const insertPreviewZip = db.prepare(
+    "INSERT OR IGNORE INTO zip_geo (zip, lat, lon) VALUES (?, ?, ?)"
+  );
+  insertPreviewZip.run("33010", 25.83309, -80.27902);
+  insertPreviewZip.run("33018", 25.92, -80.39274);
+}
+
 // =====================================================
 // HELPERS
 // =====================================================
@@ -1088,7 +1151,9 @@ if (!columnExists("orders", "inventoryDeductedAt")) {
 }
 app.use("/api/quotes", createQuotesRouter(db, authRequired, {
   makeInvoiceId,
-  nextOrderSeq
+  nextOrderSeq,
+  stripe,
+  getLocalShippingOptions: (items, customer) => computeShippingOptionsAdvanced({ items, customer }).options
 }));
 
 // =====================================================
@@ -1398,6 +1463,10 @@ app.post("/auth/forgot-password", async (req, res) => {
       return res.status(400).json({ error: "Email is required" });
     }
 
+    if (process.env.NODE_ENV === "test") {
+      return res.status(503).json({ error: "Password reset emails are disabled on this preview server. No reset email was sent." });
+    }
+
     const customer = db.prepare(`
       SELECT id, email, firstName, lastName
       FROM customers
@@ -1421,7 +1490,7 @@ db.prepare(`
   SET resetToken = ?, resetTokenExpiresAt = ?
   WHERE email = ?
 `).run(token, expiresAt, customer.email);
-    const resetLink = `http://localhost:5173/?reset_token=${encodeURIComponent(token)}`;
+    const resetLink = `${String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/$/, "")}/?reset_token=${encodeURIComponent(token)}`;
 
     const fullName =
       [customer.firstName, customer.lastName].filter(Boolean).join(" ").trim() || "Customer";
@@ -3000,6 +3069,12 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Not a Zelle order" });
     }
 
+    if (order.paymentStatus === "PAID") {
+      return res.status(409).json({ ok: false, error: "Payment already confirmed" });
+    }
+    if (order.paymentStatus !== "PENDING_ADMIN" || order.status !== "PENDING") {
+      return res.status(409).json({ ok: false, error: "Order is not awaiting Zelle confirmation" });
+    }
     const nowIso = new Date().toISOString();
     const confirmedBy = String(req.user.email || "");
 

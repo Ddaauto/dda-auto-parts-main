@@ -5,7 +5,7 @@ import { sendEmail } from "../mailer.js";
 import PDFDocument from "pdfkit";
 
 // Secure customer quote approval links
-export default function createQuotesRouter(db, authRequired, { makeInvoiceId, nextOrderSeq } = {}) {
+export default function createQuotesRouter(db, authRequired, { makeInvoiceId, nextOrderSeq, stripe, getLocalShippingOptions } = {}) {
   const router = Router();
 
  
@@ -186,7 +186,7 @@ doc.end();
     .digest("hex");
 
   const quote = db.prepare(`
-    SELECT quoteNumber, customerName, itemsJson,
+    SELECT id, quoteNumber, customerName, itemsJson,
            subtotal, tax, shipping, total,
            notes, status, expiresAt
     FROM quotes
@@ -200,8 +200,23 @@ doc.end();
   const expired = quote.expiresAt &&
     new Date(quote.expiresAt).getTime() <= Date.now();
 
+  const order = quote.status === "ACCEPTED"
+    ? db.prepare("SELECT id, orderNumber, paymentStatus, paymentMethod FROM orders WHERE quoteId = ?").get(quote.id)
+    : null;
+  const customer = order ? db.prepare("SELECT * FROM customers WHERE id = (SELECT customerId FROM orders WHERE id = ?)").get(order.id) : null;
+  const localOptions = order && customer && typeof getLocalShippingOptions === "function"
+    ? getLocalShippingOptions(JSON.parse(quote.itemsJson || "[]"), customer)
+    : [];
+  const zelleAvailable = localOptions.some(option =>
+    ["uber", "free_delivery"].includes(String(option.id)) &&
+    Math.round(Number(option.amount) * 100) === Math.round(Number(quote.shipping) * 100)
+  );
   res.json({
     ...quote,
+    orderNumber: order?.orderNumber || null,
+    paymentStatus: order?.paymentStatus || null,
+    paymentMethod: order?.paymentMethod || null,
+    zelleAvailable,
     items: JSON.parse(quote.itemsJson),
     itemsJson: undefined,
     status: expired && quote.status === "SENT"
@@ -384,6 +399,90 @@ Log in to ADMIN to review this quotation.
     }
   });
 
+
+  // Payment selection for an accepted quotation; the approval token is the capability.
+  router.post("/public/:token/payment", async (req, res) => {
+    const token = String(req.params.token || "");
+    const method = String(req.body?.method || "").toUpperCase();
+    if (!/^[a-f0-9]{64}$/.test(token)) return res.status(404).json({ error: "Quote not found" });
+    if (!["ZELLE", "CARD"].includes(method)) return res.status(400).json({ error: "Invalid payment method" });
+
+    const hash = crypto.createHash("sha256").update(token).digest("hex");
+    const quote = db.prepare("SELECT * FROM quotes WHERE approvalTokenHash = ?").get(hash);
+    if (!quote || quote.status !== "ACCEPTED") return res.status(409).json({ error: "Quote has not been accepted" });
+    const order = db.prepare("SELECT * FROM orders WHERE quoteId = ?").get(quote.id);
+    if (!order) return res.status(409).json({ error: "Linked order not found" });
+    if (order.paymentStatus === "PAID") return res.status(409).json({ error: "Order already paid" });
+    if (["CANCELLED", "REFUNDED"].includes(String(order.status).toUpperCase())) {
+      return res.status(409).json({ error: "Order is no longer payable" });
+    }
+
+    if (method === "ZELLE") {
+      if (order.stripeSessionId || String(order.paymentMethod).toLowerCase() === "card") {
+        return res.status(409).json({ error: "Card checkout already selected. Contact support to change payment method." });
+      }
+      const customer = db.prepare("SELECT * FROM customers WHERE id = ?").get(order.customerId);
+      const options = customer && typeof getLocalShippingOptions === "function"
+        ? getLocalShippingOptions(JSON.parse(order.itemsJson || "[]"), customer) : [];
+      const eligible = options.some(option =>
+        ["uber", "free_delivery"].includes(String(option.id)) &&
+        Math.round(Number(option.amount) * 100) === Math.round(Number(order.shipping) * 100)
+      );
+      if (!eligible) return res.status(400).json({ error: "Zelle is available only for eligible local delivery quotes" });
+      db.prepare(`UPDATE orders SET paymentMethod = 'Zelle', paymentStatus = 'PENDING_ADMIN'
+                  WHERE id = ? AND paymentStatus IN ('PENDING', 'PENDING_ADMIN')`).run(order.id);
+      return res.json({ ok: true, paymentStatus: "PENDING_ADMIN", orderNumber: order.orderNumber });
+    }
+
+    if (!stripe) return res.status(503).json({ error: "Card payments are not configured" });
+    if (String(order.paymentMethod).toLowerCase() === "zelle") {
+      return res.status(409).json({ error: "Zelle already selected. Contact support to change payment method." });
+    }
+    const amount = Math.round(Number(order.grandTotal) * 100);
+    if (!Number.isSafeInteger(amount) || amount < 50) {
+      return res.status(400).json({ error: "Invalid checkout amount" });
+    }
+    try {
+      // Reuse an open checkout rather than generating multiple payable sessions.
+      if (order.stripeSessionId) {
+        const existing = await stripe.checkout.sessions.retrieve(order.stripeSessionId);
+        if (existing.status === "open" && existing.url) return res.json({ ok: true, url: existing.url });
+        if (existing.payment_status === "paid") return res.status(409).json({ error: "Payment is processing" });
+      }
+      const frontend = String(process.env.FRONTEND_URL || "").replace(/\/$/, "");
+      if (!/^https:\/\//.test(frontend)) {
+        return res.status(503).json({ error: "FRONTEND_URL must be configured with HTTPS" });
+      }
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        client_reference_id: order.id,
+        line_items: [{
+          price_data: {
+            currency: "usd",
+            unit_amount: amount,
+            product_data: { name: `DDA Auto Parts quotation ${quote.quoteNumber}` }
+          },
+          quantity: 1
+        }],
+        success_url: `${frontend}/quote/${token}?payment=return`,
+        cancel_url: `${frontend}/quote/${token}?payment=cancelled`,
+        metadata: { quoteOrderId: order.id, quoteId: quote.id }
+      });
+      const updated = db.prepare(`UPDATE orders SET stripeSessionId = ?, paymentMethod = 'Card'
+        WHERE id = ? AND paymentStatus = 'PENDING' AND (stripeSessionId IS NULL OR stripeSessionId = ?)`)
+        .run(session.id, order.id, order.stripeSessionId || null);
+      if (updated.changes !== 1) {
+        await stripe.checkout.sessions.expire(session.id).catch(() => {});
+        return res.status(409).json({ error: "Payment selection changed. Reload the quote." });
+      }
+      return res.json({ ok: true, url: session.url });
+    } catch (err) {
+      console.error("Quote Stripe checkout error:", err);
+      return res.status(502).json({ error: "Unable to start card checkout" });
+    }
+  });
+
  router.use(authRequired);
 
 router.use((req, res, next) => {
@@ -559,8 +658,14 @@ try {
         });
       }
 
-      const allowed = ["DRAFT", "SENT", "ACCEPTED",
-                       "REJECTED", "EXPIRED"];
+      // Approval must go through the customer decision route to create the linked order.
+      if (req.body.status && String(req.body.status).toUpperCase() === "ACCEPTED") {
+        return res.status(409).json({ error: "Use the customer approval link to accept a quote" });
+      }
+      if (existing.status === "ACCEPTED" || existing.status === "REJECTED") {
+        return res.status(409).json({ error: "Answered quotations cannot be edited" });
+      }
+      const allowed = ["DRAFT", "SENT", "REJECTED", "EXPIRED"];
 
       const status = String(
         req.body.status || existing.status
