@@ -13,6 +13,7 @@ import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
 import stripeRoutes from "./routes/stripe.js";
 import createQuotesRouter from "./routes/quotes.js";
+import createShippingBoxesRouter from "./routes/shippingBoxes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
 
@@ -1646,6 +1647,8 @@ app.get("/auth/me", authRequired, (req, res) => {
 // =====================================================
 // ADMIN: Customers list
 // =====================================================
+app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
+
 app.get("/admin/customers", authRequired, (req, res) => {
   try {
     // Solo admin
