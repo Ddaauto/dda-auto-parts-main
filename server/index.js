@@ -1650,7 +1650,7 @@ app.get("/auth/me", authRequired, (req, res) => {
 // ADMIN: Customers list
 // =====================================================
 app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
-app.use("/admin/shippo", createShippoRatesRouter(authRequired));
+app.use("/admin/shippo", createShippoRatesRouter(db, authRequired));
 app.use("/admin/shipping-origin", createShippingOriginRouter(db, authRequired));
 
 app.get("/admin/customers", authRequired, (req, res) => {

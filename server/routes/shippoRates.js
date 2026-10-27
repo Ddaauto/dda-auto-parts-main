@@ -1,7 +1,7 @@
 import { Router } from "express";
 
 // Admin-only, read-only rate lookup. No labels are purchased and no orders are changed.
-export default function createShippoRatesRouter(authRequired) {
+export default function createShippoRatesRouter(db, authRequired) {
   const router = Router();
   router.use(authRequired);
   router.use((req, res, next) => {
@@ -11,7 +11,8 @@ export default function createShippoRatesRouter(authRequired) {
   router.post("/rates", async (req, res) => {
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured on this server" });
-    const { box, destination, origin } = req.body || {};
+    const { box, destination } = req.body || {};
+    const origin = db.prepare('SELECT * FROM shipping_origin WHERE id = 1').get();
     const positive = v => Number.isFinite(Number(v)) && Number(v) > 0;
     const zip = v => /^\d{5}(?:-\d{4})?$/.test(String(v || ""));
     const fields = ["lengthIn", "widthIn", "heightIn", "weightOz"];
@@ -22,7 +23,7 @@ export default function createShippoRatesRouter(authRequired) {
         !destination.state || !destination.street1) {
       return res.status(400).json({ error: "Full destination address is required" });
     }
-    const originZip = String(origin?.zip || "33018");
+    const originZip = String(origin?.zip || "");
     if (!zip(originZip) || !origin?.street1 || !origin?.city || !origin?.state) {
       return res.status(400).json({ error: "Full origin address is required; default ZIP is 33018" });
     }
