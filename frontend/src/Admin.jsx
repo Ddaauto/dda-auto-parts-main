@@ -1138,7 +1138,7 @@ alert("CSV imported successfully");
 
 <button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippingBoxes")}>Shipping Boxes</button>
 
-{adminTab === "shippingBoxes" && <AdminShippingBoxes api={API} />}
+{adminTab === "shippingBoxes" && <AdminShippingBoxes api={API || API_BASE} />}
 
 {/* =========================
     CUSTOMERS TAB
