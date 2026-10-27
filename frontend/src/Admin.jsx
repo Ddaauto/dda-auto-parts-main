@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import fitmentData from "./data/fitment.json";
 import AdminZellePending from "./AdminZellePending";
+import AdminShippingBoxes from "./AdminShippingBoxes";
 const API_BASE = "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
 // VITE_ADMIN_USER=admin
@@ -1184,6 +1185,10 @@ alert("CSV imported successfully");
 </button>
 
 
+
+<button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippingBoxes")}>Shipping Boxes</button>
+
+{adminTab === "shippingBoxes" && <AdminShippingBoxes api={API || API_BASE} />}
 
 {/* =========================
     CUSTOMERS TAB
