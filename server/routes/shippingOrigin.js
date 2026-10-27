@@ -27,7 +27,7 @@ export default function createShippingOriginRouter(db, authRequired) {
     const origin = Object.fromEntries(fields.map(k => [k, String(req.body?.[k] ?? "").trim()]));
     if (["name", "street1", "city", "state", "zip"].some(k => !origin[k]))
       return res.status(400).json({ error: "Name, street, city, state and ZIP are required" });
-    if (!/^\\d{5}(?:-\\d{4})?$/.test(origin.zip) || !/^[A-Za-z]{2}$/.test(origin.state))
+    if (!/^\d{5}(?:-\d{4})?$/.test(origin.zip) || !/^[A-Za-z]{2}$/.test(origin.state))
       return res.status(400).json({ error: "Invalid US ZIP or state" });
     if (fields.some(k => origin[k].length > 150))
       return res.status(400).json({ error: "Field too long" });
