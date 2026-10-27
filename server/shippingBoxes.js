@@ -45,7 +45,7 @@ export function validateShippingBox(input) {
     heightIn: dimensions[2],
     emptyWeightOz,
     weightSource: emptyWeightOz === null ? "unknown" : input.weightSource === "estimated" ? "estimated" : "measured",
-    active: input.active !== false,
+    active: input.active !== false && input.active !== 0,
   };
 }
 
