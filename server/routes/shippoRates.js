@@ -13,7 +13,7 @@ export default function createShippoRatesRouter(authRequired) {
     if (!token) return res.status(503).json({ error: "Shippo is not configured on this server" });
     const { box, destination, origin } = req.body || {};
     const positive = v => Number.isFinite(Number(v)) && Number(v) > 0;
-    const zip = v => /^\\d{5}(?:-\\d{4})?$/.test(String(v || ""));
+    const zip = v => /^\d{5}(?:-\d{4})?$/.test(String(v || ""));
     const fields = ["lengthIn", "widthIn", "heightIn", "weightOz"];
     if (!box || !fields.every(k => positive(box[k]))) {
       return res.status(400).json({ error: "Confirmed package dimensions and total weight are required" });
