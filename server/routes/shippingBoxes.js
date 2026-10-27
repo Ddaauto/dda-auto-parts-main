@@ -1,6 +1,6 @@
 import { Router } from "express";
 import crypto from "crypto";
-import { INITIAL_SHIPPING_BOXES, validateShippingBox } from "../shippingBoxes.js";
+import { INITIAL_SHIPPING_BOXES, validateShippingBox, recommendBoxForItems } from "../shippingBoxes.js";
 
 export default function createShippingBoxesRouter(db, authRequired) {
   db.exec(`CREATE TABLE IF NOT EXISTS shipping_boxes (
@@ -28,6 +28,40 @@ export default function createShippingBoxesRouter(db, authRequired) {
   router.use((req, res, next) => {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
     next();
+  });
+
+  // Packing preview only: no order modification, carrier quote, or label purchase.
+  router.post("/recommend", (req, res) => {
+    const items = req.body?.items;
+    if (!Array.isArray(items) || !items.length || items.length > 50) {
+      return res.status(400).json({ error: "Provide 1 to 50 items" });
+    }
+    let count = 0;
+    for (const item of items) {
+      const qty = Number(item.qty);
+      count += qty;
+      if (!Number.isInteger(qty) || qty < 1 || qty > 50 || count > 50 ||
+          !["lengthIn", "widthIn", "heightIn"].every(k =>
+            Number.isFinite(Number(item[k])) && Number(item[k]) > 0)) {
+        return res.status(400).json({ error: "Valid dimensions and quantities are required; do not guess them" });
+      }
+    }
+    const boxes = db.prepare("SELECT * FROM shipping_boxes WHERE active = 1").all();
+    const box = recommendBoxForItems(items, boxes);
+    if (!box) return res.json({ box: null, warning: "No confirmed fit; choose packaging manually" });
+    const weightsKnown = items.every(it => it.weightOz !== "" && it.weightOz != null &&
+      Number.isFinite(Number(it.weightOz)) && Number(it.weightOz) > 0);
+    const boxWeightKnown = box.emptyWeightOz != null && Number.isFinite(Number(box.emptyWeightOz));
+    const totalWeightOz = weightsKnown && boxWeightKnown
+      ? items.reduce((sum, it) => sum + Number(it.weightOz) * Number(it.qty), Number(box.emptyWeightOz))
+      : null;
+    return res.json({
+      box: { ...box, active: Boolean(box.active) },
+      totalWeightOz,
+      estimated: !weightsKnown || !boxWeightKnown || box.weightSource !== "measured" ||
+        items.some(it => it.weightSource !== "measured"),
+      warning: "Packing is provisional. Verify dimensions, cushioning and final weight before purchasing a label.",
+    });
   });
 
   router.get("/", (_req, res) => {

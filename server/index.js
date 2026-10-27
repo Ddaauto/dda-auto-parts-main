@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import createShippingBoxesRouter from "./routes/shippingBoxes.js";
+import createShippoRatesRouter from "./routes/shippoRates.js";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -1648,6 +1649,7 @@ app.get("/auth/me", authRequired, (req, res) => {
 // ADMIN: Customers list
 // =====================================================
 app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
+app.use("/admin/shippo", createShippoRatesRouter(authRequired));
 
 app.get("/admin/customers", authRequired, (req, res) => {
   try {

@@ -45,7 +45,7 @@ export function validateShippingBox(input) {
     heightIn: dimensions[2],
     emptyWeightOz,
     weightSource: emptyWeightOz === null ? "unknown" : input.weightSource === "estimated" ? "estimated" : "measured",
-    active: input.active !== false,
+    active: input.active !== false && input.active !== 0,
   };
 }
 
@@ -61,4 +61,48 @@ export function recommendBoxForSingleItem(item, boxes) {
   if (!item || ![item.lengthIn, item.widthIn, item.heightIn].every((v) => Number(v) > 0)) return null;
   return boxes.filter((box) => box.active && fitsBox(item, box))
     .sort((a, b) => a.lengthIn * a.widthIn * a.heightIn - b.lengthIn * b.widthIn * b.heightIn)[0] || null;
+}
+
+
+// Conservative orthogonal packing: every item occupies a non-overlapping rectangular
+// space. A failed result means "not confirmed", not proof that packing is impossible.
+// Padding, fragile-item separation and irregular shapes require human confirmation.
+export function recommendBoxForItems(items, boxes) {
+  if (!Array.isArray(items) || !items.length) return null;
+  const pieces = [];
+  for (const item of items) {
+    const dims = [item.lengthIn, item.widthIn, item.heightIn].map(Number);
+    const qty = Number(item.qty);
+    if (!dims.every(v => Number.isFinite(v) && v > 0) ||
+        !Number.isInteger(qty) || qty < 1 || qty > 50 || pieces.length + qty > 50) return null;
+    for (let n = 0; n < qty; n++) pieces.push(dims);
+  }
+  pieces.sort((a, b) => b[0] * b[1] * b[2] - a[0] * a[1] * a[2]);
+  const candidates = (boxes || []).filter(b => b.active)
+    .sort((a, b) => a.lengthIn * a.widthIn * a.heightIn - b.lengthIn * b.widthIn * b.heightIn);
+  const orientations = (d) => {
+    const [x, y, z] = d;
+    return [[x,y,z],[x,z,y],[y,x,z],[y,z,x],[z,x,y],[z,y,x]];
+  };
+  for (const box of candidates) {
+    let spaces = [[Number(box.lengthIn), Number(box.widthIn), Number(box.heightIn)]];
+    let fits = true;
+    for (const piece of pieces) {
+      let placed = false;
+      for (let i = 0; i < spaces.length && !placed; i++) {
+        const [l, w, h] = spaces[i];
+        for (const [x, y, z] of orientations(piece)) {
+          if (x > l || y > w || z > h) continue;
+          spaces.splice(i, 1,
+            [l-x, w, h], [x, w-y, h], [x, y, h-z]);
+          spaces = spaces.filter(s => s.every(v => v > 0));
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) { fits = false; break; }
+    }
+    if (fits) return box;
+  }
+  return null;
 }
