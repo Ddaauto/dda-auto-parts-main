@@ -1,6 +1,6 @@
 import { Router } from "express";
 import crypto from "crypto";
-import { INITIAL_SHIPPING_BOXES, validateShippingBox } from "../shippingBoxes.js";
+import { INITIAL_SHIPPING_BOXES, validateShippingBox, recommendBoxForSingleItem } from "../shippingBoxes.js";
 
 export default function createShippingBoxesRouter(db, authRequired) {
   db.exec(`CREATE TABLE IF NOT EXISTS shipping_boxes (
@@ -28,6 +28,31 @@ export default function createShippingBoxesRouter(db, authRequired) {
   router.use((req, res, next) => {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
     next();
+  });
+
+  // Preview packaging for one item; never creates a shipping label or changes an order.
+  // Multiple items require a separate packing algorithm.
+  router.post("/recommend", (req, res) => {
+    const items = req.body?.items;
+    if (!Array.isArray(items) || items.length !== 1 || Number(items[0]?.qty) !== 1) {
+      return res.status(400).json({ error: "Recommendation currently supports one item, quantity 1 only" });
+    }
+    const item = items[0];
+    if (!["lengthIn", "widthIn", "heightIn"].every(k => Number.isFinite(Number(item[k])) && Number(item[k]) > 0)) {
+      return res.status(400).json({ error: "Item dimensions are required; do not guess them" });
+    }
+    const boxes = db.prepare("SELECT * FROM shipping_boxes WHERE active = 1").all();
+    const box = recommendBoxForSingleItem(item, boxes);
+    if (!box) return res.json({ box: null, warning: "No standard box fits this item" });
+    const itemWeightOz = Number(item.weightOz);
+    const hasItemWeight = item.weightOz !== "" && item.weightOz != null && Number.isFinite(itemWeightOz) && itemWeightOz > 0;
+    const hasBoxWeight = box.emptyWeightOz != null && Number.isFinite(Number(box.emptyWeightOz));
+    return res.json({
+      box: { ...box, active: Boolean(box.active) },
+      totalWeightOz: hasItemWeight && hasBoxWeight ? itemWeightOz + Number(box.emptyWeightOz) : null,
+      estimated: !hasItemWeight || !hasBoxWeight || box.weightSource !== "measured" || item.weightSource !== "measured",
+      warning: !hasItemWeight || !hasBoxWeight ? "Missing weight: cannot calculate a verified parcel weight" : null,
+    });
   });
 
   router.get("/", (_req, res) => {
