@@ -928,9 +928,9 @@ const filteredOrders = (orders || []).filter((o) => {
 const getOrderCategory = o => {
   const status = String(o.status || "").toUpperCase();
   const payment = String(o.paymentStatus || "").toUpperCase();
-  if (["CANCELLED", "CANCELED", "CANCEL_REQUESTED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
+  if (["CANCELLED", "CANCELED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
   if (["SHIPPED", "DELIVERED"].includes(status)) return "shipped";
-  if (status === "PAID" && payment === "PAID") return "unshipped";
+  if (["PAID", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
   return "pending";
 };
 const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((counts, category) => {
@@ -1381,12 +1381,13 @@ alert("CSV imported successfully");
         const detailsOpen = Boolean(expandedOrderDetails[o.id]);
         const status = String(o.status || o.paymentStatus || "PENDING").toUpperCase();
         const paid = String(o.paymentStatus || "").toUpperCase() === "PAID";
+        const cancellationPending = status === "CANCEL_REQUESTED";
         return <div key={o.id} style={{ border: "1px solid #e2e8f0", borderRadius: 14, padding: 18, background: "#fff" }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
             <div style={{ flex: "1 1 250px", minWidth: 0 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                 <strong style={{ fontSize: 17 }}>{o.orderNumber || o.invoiceId}</strong>
-                <span style={{ fontSize: 12, fontWeight: 700, borderRadius: 20, padding: "4px 10px", background: status === "CANCELLED" ? "#fee2e2" : paid ? "#dcfce7" : "#fef3c7", color: status === "CANCELLED" ? "#991b1b" : paid ? "#166534" : "#92400e" }}>{status}</span>
+                <span style={{ fontSize: 12, fontWeight: 700, borderRadius: 20, padding: "4px 10px", background: status === "CANCELLED" ? "#fee2e2" : cancellationPending ? "#fef3c7" : paid ? "#dcfce7" : "#fef3c7", color: status === "CANCELLED" ? "#991b1b" : cancellationPending ? "#92400e" : paid ? "#166534" : "#92400e" }}>{status}</span>
               </div>
               <div style={{ color: "#475569", marginTop: 7, overflowWrap: "anywhere" }}>{o.email || "Customer email unavailable"}</div>
               <div style={{ color: "#64748b", fontSize: 12, marginTop: 5 }}>{o.createdAt ? new Date(o.createdAt).toLocaleDateString() : ""} · {o.paymentMethod || "Payment not specified"}</div>
