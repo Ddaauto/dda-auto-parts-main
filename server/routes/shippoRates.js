@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { plannedShipDate, addBusinessDays } from "../shippingCalendar.js";
 
 // Admin-only, read-only rate lookup. No labels are purchased and no orders are changed.
 export default function createShippoRatesRouter(db, authRequired) {
@@ -60,8 +61,10 @@ export default function createShippoRatesRouter(db, authRequired) {
       if (!response.ok) {
         return res.status(502).json({ error: "Shippo rate request failed", details: data?.detail || null });
       }
+      const shipDate = plannedShipDate();
       return res.json({
         shipmentId: data.object_id,
+        plannedShipDate: shipDate,
         rates: (data.rates || []).map(rate => ({
           id: rate.object_id,
           carrier: rate.provider,
@@ -69,6 +72,11 @@ export default function createShippoRatesRouter(db, authRequired) {
           amount: rate.amount,
           currency: rate.currency,
           estimatedDays: rate.estimated_days ?? null,
+          // Conservative business-day window; carrier-specific delivery schedules may differ.
+          estimatedDeliveryStart: Number.isInteger(Number(rate.estimated_days)) && Number(rate.estimated_days) > 0
+            ? addBusinessDays(shipDate, Number(rate.estimated_days)) : null,
+          estimatedDeliveryEnd: Number.isInteger(Number(rate.estimated_days)) && Number(rate.estimated_days) > 0
+            ? addBusinessDays(shipDate, Number(rate.estimated_days) + 1) : null,
           durationTerms: rate.duration_terms || null,
           test: rate.test === true,
         })),
