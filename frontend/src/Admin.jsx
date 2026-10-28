@@ -936,18 +936,6 @@ const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((coun
   return counts;
 }, {});
 const visibleOrders = filteredOrders.filter(o => getOrderCategory(o) === orderCategory);
-const markOrderShipped = async id => {
-  if (!window.confirm("Confirm that this order has actually shipped?")) return;
-  try {
-    const res = await fetch(`${API}/admin/orders/${encodeURIComponent(id)}/mark-shipped`, {
-      method: "POST", headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Unable to update shipping status");
-    setOrders(old => old.map(o => o.id === id ? { ...o, status: "SHIPPED" } : o));
-    setOrderCategory("shipped");
-  } catch (err) { alert(err.message); }
-};
   // ====== LOGIN SCREEN ======
   if (!authorized) {
     return (
@@ -1416,7 +1404,6 @@ alert("CSV imported successfully");
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
             <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
-            {getOrderCategory(o) === "unshipped" && <button className="btn" onClick={() => markOrderShipped(o.id)}>Mark as Shipped</button>}
             <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
             <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
           </div>
