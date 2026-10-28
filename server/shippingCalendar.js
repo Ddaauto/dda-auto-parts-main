@@ -57,3 +57,11 @@ export function plannedShipDate(orderTimestamp = new Date()) {
     ? ordered : nextBusinessDay(ordered);
   return key(nextBusinessDay(preparationStart));
 }
+
+export function addBusinessDays(dateString, count) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateString));
+  if (!match || !Number.isInteger(count) || count < 0) throw new Error("Invalid delivery date or days");
+  let date = day(Number(match[1]), Number(match[2]), Number(match[3]));
+  for (let i = 0; i < count; i++) date = nextBusinessDay(date);
+  return key(date);
+}

@@ -17,6 +17,7 @@ export default function AdminShippoRates({ api }) {
   }, [api]);
   const [rates, setRates] = useState(null);
   const [error, setError] = useState("");
+  const formatDate = value => value ? new Date(`${value}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }) : null;
   const sortedRates = [...(rates?.rates || [])].sort((a, b) => Number(a.amount) - Number(b.amount));
   const [busy, setBusy] = useState(false);
   const update = (key, value) => setForm(old => ({ ...old, [key]: value }));
@@ -78,7 +79,8 @@ export default function AdminShippoRates({ api }) {
     {rates && <div style={{ marginTop: 16 }}>
       <h3>Available rates {rates.rates?.length ? `(${rates.rates.length})` : ""}</h3>
       {!rates.rates?.length && <p>No rates returned for this package and address.</p>}
-      <p style={{ color: "#64748b", marginTop: 4 }}>Sorted by price: lowest to highest.</p>
+      <p style={{ color: "#64748b", marginTop: 4 }}>Sorted by price: lowest to highest. Delivery windows are approximate, not guaranteed; carrier schedules may vary.</p>
+      {rates.plannedShipDate && <p style={{ marginTop: 8, fontWeight: 600 }}>Planned ship date: {formatDate(rates.plannedShipDate)}</p>}
       <div style={{ overflowX: "auto", marginTop: 16 }}>
         <table style={{ width: "100%", textAlign: "left", borderCollapse: "separate", borderSpacing: "0 8px", minWidth: 680 }}>
           <thead><tr style={{ color: "#475569" }}>
@@ -89,7 +91,7 @@ export default function AdminShippoRates({ api }) {
             <td style={{ padding: "18px", borderRadius: "10px 0 0 10px", fontWeight: 700 }}>{rate.carrier}</td>
             <td style={{ padding: "18px" }}>{rate.service}{index === 0 && <span style={{ display: "inline-block", marginLeft: 10, padding: "4px 9px", background: "#047857", color: "#fff", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>Lowest price</span>}</td>
             <td style={{ padding: "18px", fontWeight: 800, fontSize: 17, whiteSpace: "nowrap" }}>{Number(rate.amount).toFixed(2)} {rate.currency}</td>
-            <td style={{ padding: "18px" }}>{rate.estimatedDays == null ? "Not provided" : `${rate.estimatedDays} ${rate.estimatedDays === 1 ? "day" : "days"}`}</td>
+            <td style={{ padding: "18px" }}>{rate.estimatedDeliveryStart && rate.estimatedDeliveryEnd ? <><strong>{formatDate(rate.estimatedDeliveryStart)} – {formatDate(rate.estimatedDeliveryEnd)}</strong><div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>Approx. {rate.estimatedDays} transit days + buffer</div></> : "Not provided"}</td>
             <td style={{ padding: "18px", borderRadius: "0 10px 10px 0" }}>{rate.test ? "Test" : "Live"}</td>
           </tr>)}</tbody>
         </table>
