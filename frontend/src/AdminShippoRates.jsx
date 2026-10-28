@@ -17,6 +17,7 @@ export default function AdminShippoRates({ api }) {
   }, [api]);
   const [rates, setRates] = useState(null);
   const [error, setError] = useState("");
+  const sortedRates = [...(rates?.rates || [])].sort((a, b) => Number(a.amount) - Number(b.amount));
   const [busy, setBusy] = useState(false);
   const update = (key, value) => setForm(old => ({ ...old, [key]: value }));
   const submit = async e => {
@@ -77,14 +78,19 @@ export default function AdminShippoRates({ api }) {
     {rates && <div style={{ marginTop: 16 }}>
       <h3>Available rates {rates.rates?.length ? `(${rates.rates.length})` : ""}</h3>
       {!rates.rates?.length && <p>No rates returned for this package and address.</p>}
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", textAlign: "left" }}>
-          <thead><tr><th>Carrier</th><th>Service</th><th>Rate</th><th>Estimated days</th><th>Mode</th></tr></thead>
-          <tbody>{(rates.rates || []).map(rate => <tr key={rate.id}>
-            <td>{rate.carrier}</td><td>{rate.service}</td>
-            <td>{rate.amount} {rate.currency}</td>
-            <td>{rate.estimatedDays ?? "Not provided"}</td>
-            <td>{rate.test ? "Test" : "Live"}</td>
+      <p style={{ color: "#64748b", marginTop: 4 }}>Sorted by price: lowest to highest.</p>
+      <div style={{ overflowX: "auto", marginTop: 16 }}>
+        <table style={{ width: "100%", textAlign: "left", borderCollapse: "separate", borderSpacing: "0 8px", minWidth: 680 }}>
+          <thead><tr style={{ color: "#475569" }}>
+            {["Carrier", "Service", "Price", "Estimated delivery", "Mode"].map(label =>
+              <th key={label} style={{ padding: "12px 18px", fontSize: 13, fontWeight: 700 }}>{label}</th>)}
+          </tr></thead>
+          <tbody>{sortedRates.map((rate, index) => <tr key={rate.id || index} style={{ background: index === 0 ? "#ecfdf5" : "#f8fafc" }}>
+            <td style={{ padding: "18px", borderRadius: "10px 0 0 10px", fontWeight: 700 }}>{rate.carrier}</td>
+            <td style={{ padding: "18px" }}>{rate.service}{index === 0 && <span style={{ display: "inline-block", marginLeft: 10, padding: "4px 9px", background: "#047857", color: "#fff", borderRadius: 20, fontSize: 12, fontWeight: 700 }}>Lowest price</span>}</td>
+            <td style={{ padding: "18px", fontWeight: 800, fontSize: 17, whiteSpace: "nowrap" }}>{Number(rate.amount).toFixed(2)} {rate.currency}</td>
+            <td style={{ padding: "18px" }}>{rate.estimatedDays == null ? "Not provided" : `${rate.estimatedDays} ${rate.estimatedDays === 1 ? "day" : "days"}`}</td>
+            <td style={{ padding: "18px", borderRadius: "0 10px 10px 0" }}>{rate.test ? "Test" : "Live"}</td>
           </tr>)}</tbody>
         </table>
       </div>
