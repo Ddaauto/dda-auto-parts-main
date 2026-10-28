@@ -9,6 +9,31 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
     next();
   });
+  // Persistent record for purchased labels. Populated by the future purchase workflow.
+  db.exec(`CREATE TABLE IF NOT EXISTS shipping_labels (
+    id TEXT PRIMARY KEY,
+    orderId TEXT NOT NULL,
+    shippoTransactionId TEXT NOT NULL UNIQUE,
+    carrier TEXT NOT NULL DEFAULT '',
+    service TEXT NOT NULL DEFAULT '',
+    trackingNumber TEXT NOT NULL DEFAULT '',
+    trackingUrl TEXT NOT NULL DEFAULT '',
+    labelUrl TEXT NOT NULL DEFAULT '',
+    amount TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL DEFAULT 'USD',
+    lengthIn REAL, widthIn REAL, heightIn REAL, weightOz REAL,
+    purchasedAt TEXT NOT NULL,
+    refundStatus TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(orderId) REFERENCES orders(id)
+  )`);
+  router.get("/orders/:id/labels", (req, res) => {
+    const exists = db.prepare("SELECT id FROM orders WHERE id = ?").get(req.params.id);
+    if (!exists) return res.status(404).json({ error: "Order not found" });
+    const labels = db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
+      labelUrl, amount, currency, lengthIn, widthIn, heightIn, weightOz,
+      purchasedAt, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
+    res.json({ labels });
+  });
   const orderSnapshot = id => {
     const row = db.prepare(`SELECT id, orderNumber, invoiceId, createdAt, customerSnapshot, itemsJson, status FROM orders WHERE id = ?`).get(id);
     if (!row) return null;

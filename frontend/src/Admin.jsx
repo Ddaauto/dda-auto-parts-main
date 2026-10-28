@@ -4,6 +4,7 @@ import fitmentData from "./data/fitment.json";
 import AdminZellePending from "./AdminZellePending";
 import AdminShippingBoxes from "./AdminShippingBoxes";
 import AdminShippoRates from "./AdminShippoRates";
+import AdminShippingLabelDetails from "./AdminShippingLabelDetails";
 import AdminShippingOrigin from "./AdminShippingOrigin";
 const API_BASE = "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
@@ -150,6 +151,7 @@ const [orderEventsOpen, setOrderEventsOpen] = useState({});
 const [orderEventsLoading, setOrderEventsLoading] = useState({});
 const [orderSearch, setOrderSearch] = useState("");
 const [expandedOrderDetails, setExpandedOrderDetails] = useState({});
+const [expandedShippingLabels, setExpandedShippingLabels] = useState({});
 const [orderCategory, setOrderCategory] = useState("unshipped");
 const [dashboardStats, setDashboardStats] = useState({
   totalOrders: 0,
@@ -1404,9 +1406,13 @@ alert("CSV imported successfully");
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
             <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
+            {getOrderCategory(o) === "shipped" && <button className="btn" onClick={() => setExpandedShippingLabels(old => ({ ...old, [o.id]: !old[o.id] }))}>{expandedShippingLabels[o.id] ? "Hide label details" : "Shipping Label Details"}</button>}
             <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
             <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
           </div>
+          {getOrderCategory(o) === "shipped" && expandedShippingLabels[o.id] && <div style={{ marginTop: 16, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
+            <AdminShippingLabelDetails api={API_BASE} orderId={o.id} />
+          </div>}
           {detailsOpen && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, fontSize: 13 }}>
               {[
