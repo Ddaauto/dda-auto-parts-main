@@ -1678,6 +1678,18 @@ app.get("/admin/customers", authRequired, (req, res) => {
 // =====================================================
 // ADMIN: Orders list
 // =====================================================
+// Admin confirms physical dispatch; payment status is never modified.
+app.post("/admin/orders/:id/mark-shipped", authRequired, (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
+  const order = db.prepare("SELECT id, status, paymentStatus FROM orders WHERE id = ?").get(req.params.id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (String(order.status).toUpperCase() === "SHIPPED") return res.json({ ok: true, status: "SHIPPED" });
+  if (String(order.status).toUpperCase() !== "PAID" || String(order.paymentStatus).toUpperCase() !== "PAID")
+    return res.status(409).json({ error: "Only paid, non-cancelled orders can be marked shipped" });
+  db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'PAID'").run(order.id);
+  return res.json({ ok: true, status: "SHIPPED" });
+});
+
 app.get("/admin/orders", authRequired, (req, res) => {
   try {
     if (req.user?.role !== "admin") {

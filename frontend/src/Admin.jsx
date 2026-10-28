@@ -150,6 +150,7 @@ const [orderEventsOpen, setOrderEventsOpen] = useState({});
 const [orderEventsLoading, setOrderEventsLoading] = useState({});
 const [orderSearch, setOrderSearch] = useState("");
 const [expandedOrderDetails, setExpandedOrderDetails] = useState({});
+const [orderCategory, setOrderCategory] = useState("unshipped");
 const [dashboardStats, setDashboardStats] = useState({
   totalOrders: 0,
   revenue: 0,
@@ -922,6 +923,31 @@ const filteredOrders = (orders || []).filter((o) => {
     o.id,
   ].some((v) => String(v || "").toLowerCase().includes(q));
 });
+const getOrderCategory = o => {
+  const status = String(o.status || "").toUpperCase();
+  const payment = String(o.paymentStatus || "").toUpperCase();
+  if (["CANCELLED", "CANCELED", "CANCEL_REQUESTED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
+  if (["SHIPPED", "DELIVERED"].includes(status)) return "shipped";
+  if (status === "PAID" && payment === "PAID") return "unshipped";
+  return "pending";
+};
+const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((counts, category) => {
+  counts[category] = (orders || []).filter(o => getOrderCategory(o) === category).length;
+  return counts;
+}, {});
+const visibleOrders = filteredOrders.filter(o => getOrderCategory(o) === orderCategory);
+const markOrderShipped = async id => {
+  if (!window.confirm("Confirm that this order has actually shipped?")) return;
+  try {
+    const res = await fetch(`${API}/admin/orders/${encodeURIComponent(id)}/mark-shipped`, {
+      method: "POST", headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Unable to update shipping status");
+    setOrders(old => old.map(o => o.id === id ? { ...o, status: "SHIPPED" } : o));
+    setOrderCategory("shipped");
+  } catch (err) { alert(err.message); }
+};
   // ====== LOGIN SCREEN ======
   if (!authorized) {
     return (
@@ -1338,18 +1364,27 @@ alert("CSV imported successfully");
     />
   </div>
 </div>
+<div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16, paddingBottom: 12, borderBottom: "1px solid #e2e8f0" }}>
+  {[
+    ["pending", "Pending"], ["unshipped", "Unshipped"],
+    ["canceled", "Canceled"], ["shipped", "Shipped"]
+  ].map(([id, label]) => <button key={id} type="button" onClick={() => setOrderCategory(id)}
+    className="btn" style={{ background: orderCategory === id ? "#1e3a5f" : "#f1f5f9", color: orderCategory === id ? "#fff" : "#334155", fontWeight: orderCategory === id ? 800 : 500 }}>
+    {label} ({orderCounts[id] || 0})
+  </button>)}
+</div>
    {/* ORDERS — compact, readable cards */}
 <div className="card" style={{ marginTop: 16, width: "100%", maxWidth: "100%" }}>
   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
     <div>
       <div style={{ fontWeight: 800, fontSize: 21 }}>Manage Orders</div>
-      <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>{filteredOrders.length} orders shown</div>
+      <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>{visibleOrders.length} orders shown · {orderCategory}</div>
     </div>
     <button className="btn" onClick={loadOrders} disabled={ordersLoading}>Refresh</button>
   </div>
   {ordersLoading ? <p>Loading orders...</p> : (
     <div style={{ display: "grid", gap: 12 }}>
-      {filteredOrders.map(o => {
+      {visibleOrders.map(o => {
         let items = [];
         try { items = JSON.parse(o.itemsJson || "[]"); } catch {}
         if (!Array.isArray(items)) items = [];
@@ -1381,6 +1416,7 @@ alert("CSV imported successfully");
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
             <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
+            {getOrderCategory(o) === "unshipped" && <button className="btn" onClick={() => markOrderShipped(o.id)}>Mark as Shipped</button>}
             <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
             <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
           </div>
@@ -1413,7 +1449,7 @@ alert("CSV imported successfully");
           </div>}
         </div>;
       })}
-      {!filteredOrders.length && <div style={{ textAlign: "center", padding: 32, color: "#64748b" }}>No orders found.</div>}
+      {!visibleOrders.length && <div style={{ textAlign: "center", padding: 32, color: "#64748b" }}>No orders found.</div>}
     </div>
   )}
 </div>
