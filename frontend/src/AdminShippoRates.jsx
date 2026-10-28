@@ -6,6 +6,24 @@ export default function AdminShippoRates({ api }) {
     toStreet: "", toCity: "", toState: "", toZip: "",
   });
   const [origin, setOrigin] = useState(null);
+  const [orders, setOrders] = useState([]);
+  const [selectedOrder, setSelectedOrder] = useState(null);
+  const [ordersError, setOrdersError] = useState("");
+  const loadOrders = async () => {
+    try {
+      const res = await fetch(`${api}/admin/shippo/orders`, { headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}` } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not load orders");
+      setOrders(data.orders || []);
+    } catch (err) { setOrdersError(err.message); }
+  };
+  useEffect(() => { loadOrders(); }, [api]);
+  const chooseOrder = id => {
+    const order = orders.find(o => o.id === id) || null;
+    setSelectedOrder(order);
+    setRates(null);
+    if (order) setForm(old => ({ ...old, toStreet: order.customer.street1, toCity: order.customer.city, toState: order.customer.state, toZip: order.customer.zip }));
+  };
   const [originError, setOriginError] = useState("");
   useEffect(() => {
     let active = true;
@@ -52,6 +70,23 @@ export default function AdminShippoRates({ api }) {
   return <div className="card" style={{ marginTop: 16 }}>
     <h2>Shippo – Live shipping rates</h2>
     <p>Admin preview only. Enter verified package dimensions and total packed weight. No label is purchased and no order is changed.</p>
+    <section style={{ margin: "20px 0", padding: 20, background: "#f8fafc", borderRadius: 12 }}>
+      <h3 style={{ marginTop: 0 }}>Order details</h3>
+      <label style={{ display: "grid", gap: 8, maxWidth: 520 }}>Select DDA Auto Parts order
+        <select className="input" value={selectedOrder?.id || ""} onChange={e => chooseOrder(e.target.value)}>
+          <option value="">Manual rate lookup (no order selected)</option>
+          {orders.map(order => <option key={order.id} value={order.id}>{order.orderNumber || order.invoiceId || order.id} — {order.customer.name || order.customer.email}</option>)}
+        </select>
+      </label>
+      {ordersError && <p role="alert" style={{ color: "#dc2626" }}>{ordersError}</p>}
+      {!orders.length && !ordersError && <p style={{ color: "#64748b" }}>No orders yet. You can still check rates manually. Orders will appear here automatically.</p>}
+      {selectedOrder && <div style={{ marginTop: 16 }}>
+        <p><strong>Order:</strong> {selectedOrder.orderNumber || selectedOrder.invoiceId} · <strong>Customer:</strong> {selectedOrder.customer.name || selectedOrder.customer.email}</p>
+        <p><strong>Ship to:</strong> {[selectedOrder.customer.street1, selectedOrder.customer.city, selectedOrder.customer.state, selectedOrder.customer.zip].filter(Boolean).join(", ") || "Missing shipping address"}</p>
+        <h4>Products in shipment</h4>
+        {selectedOrder.items.length ? selectedOrder.items.map((item, index) => <div key={item.id || index} style={{ display: "flex", justifyContent: "space-between", padding: "12px 4px", borderBottom: "1px solid #e2e8f0" }}><span><strong>{item.name}</strong>{item.sku && <small style={{ display: "block", color: "#64748b" }}>SKU: {item.sku}</small>}</span><strong>Qty: {item.qty}</strong></div>) : <p>No product details available.</p>}
+      </div>}
+    </section>
     <form onSubmit={submit} style={{ display: "grid", gap: 12 }}>
       <h3>Package (inches / ounces)</h3>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
@@ -64,7 +99,7 @@ export default function AdminShippoRates({ api }) {
       {originError && <p role="alert" style={{ color: "#dc2626" }}>Unable to load saved origin: {originError}</p>}
       {origin ? <p>{[origin.name, origin.street1, origin.street2, origin.city, origin.state, origin.zip].filter(Boolean).join(", ")}</p> : !originError && <p>Loading saved shipping origin...</p>}
       <p>To change this address, use the Shipping Origin tab.</p>
-      <h3>Ship to</h3>
+      <h3>Ship to {selectedOrder ? "(from customer order — review before quoting)" : ""}</h3>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         {field("toStreet", "Street address")}
         {field("toCity", "City")}

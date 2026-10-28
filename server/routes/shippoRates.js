@@ -9,6 +9,26 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
     next();
   });
+  // Order snapshots preserve the address and items as they were at purchase time.
+  router.get("/orders", (req, res) => {
+    const rows = db.prepare(`SELECT id, orderNumber, invoiceId, createdAt, customerSnapshot, itemsJson, status
+      FROM orders ORDER BY createdAt DESC LIMIT 100`).all();
+    const orders = rows.map(({ customerSnapshot, itemsJson, ...order }) => {
+      let customer = {}, items = [];
+      try { customer = JSON.parse(customerSnapshot || "{}"); } catch {}
+      try { items = JSON.parse(itemsJson || "[]"); } catch {}
+      return { ...order, customer: {
+        name: [customer.firstName, customer.lastName].filter(Boolean).join(" "),
+        email: customer.email || "",
+        street1: customer.street || customer.address || "",
+        city: customer.city || "", state: customer.state || "", zip: customer.zip || "",
+      }, items: Array.isArray(items) ? items.map(item => ({
+        id: item.id, name: item.name || item.title || item.sku || "Product",
+        sku: item.sku || "", qty: Number(item.qty || item.quantity || 1),
+      })) : [] };
+    });
+    res.json({ orders });
+  });
   router.post("/rates", async (req, res) => {
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured on this server" });
