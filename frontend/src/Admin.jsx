@@ -1192,9 +1192,9 @@ alert("CSV imported successfully");
 <button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippingOrigin")}>Shipping Origin</button>
 <button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippoRates")}>Shippo Rates</button>
 
-{adminTab === "shippingBoxes" && <AdminShippingBoxes api={API || API_BASE} />}
-{adminTab === "shippingOrigin" && <AdminShippingOrigin api={API || API_BASE} />}
-{adminTab === "shippoRates" && <AdminShippoRates api={API || API_BASE} />}
+{adminTab === "shippingBoxes" && <AdminShippingBoxes api={API_BASE} />}
+{adminTab === "shippingOrigin" && <AdminShippingOrigin api={API_BASE} />}
+{adminTab === "shippoRates" && <AdminShippoRates api={API_BASE} />}
 
 {/* =========================
     CUSTOMERS TAB
