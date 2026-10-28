@@ -1337,187 +1337,85 @@ alert("CSV imported successfully");
     />
   </div>
 </div>
-   {/* ORDERS */}
+   {/* ORDERS — compact, readable cards */}
 <div className="card" style={{ marginTop: 16, width: "100%", maxWidth: "100%" }}>
-  <div style={{ fontWeight: 800, marginBottom: 10, fontSize: 17 }}>Orders</div>
-
-  {ordersLoading ? (
-    <div>Loading...</div>
-  ) : (
-    <div style={{ overflowX: "hidden" }}>
-      <table
-        style={{
-          width: "100%",
-          borderCollapse: "collapse",
-          whiteSpace: "nowrap",
-          fontSize: 14
-        }}
-      >
-        <thead>
-          <tr>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Order #</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Invoice</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Email</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Total</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Tax</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Shipping</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Cost</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Profit</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Status</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Payment</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Date</th>
-            <th style={{ textAlign: "left", padding: 5, borderBottom: "1px solid #eee" }}>Actions</th>
-          </tr>
-        </thead>
-
-        <tbody>
-          {(filteredOrders || []).map((o) => (
-            <React.Fragment key={o.id}>
-              <tr>
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3" }}>{o.orderNumber}</td>
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3" }}>{o.invoiceId}</td>
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3" }}>{o.email}</td>
-
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3", textAlign: "right" }}>
-                  ${Number(o.grandTotal || 0).toFixed(2)}
-                </td>
-
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3", textAlign: "right" }}>
-                  ${Number(o.tax || 0).toFixed(2)}
-                </td>
-
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3", textAlign: "right" }}>
-                  ${Number(o.shipping || 0).toFixed(2)}
-                </td>
-
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3", textAlign: "right" }}>
-                  ${Number(o.cost || 0).toFixed(2)}
-                </td>
-
-                <td style={{ padding: 4, borderBottom: "1px solid #f3f3f3", textAlign: "right" }}>
-                  ${Number(o.profit || 0).toFixed(2)}
-                </td>
-
-                <td style={{ padding: 5, borderBottom: "1px solid #f3f3f3" }}>
-                  {o.status || o.paymentStatus}
-                </td>
-
-                <td style={{ padding: 5, borderBottom: "1px solid #f3f3f3" }}>
-                  {o.paymentMethod}
-                </td>
-
-                <td style={{ padding: 5, borderBottom: "1px solid #f3f3f3" }}>
-                  {o.createdAt}
-                </td>
-
-                <td style={{ padding: 5, borderBottom: "1px solid #f3f3f3" }}>
-                  <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
-                    {String(o.status || "").toUpperCase() === "CANCEL_REQUESTED" ? (
-                      <>
-                        <button className="btn" onClick={() => approveCancelOrder(o.id)}>
-                          Approve
-                        </button>
-
-                        <button
-                          className="btn"
-                          style={{ background: "#eee" }}
-                          onClick={() => rejectCancelOrder(o.id)}
-                        >
-                          Reject
-                        </button>
-                      </>
-                    ) : String(o.status || "").toUpperCase() !== "CANCELLED" ? (
-                      <button className="btn" onClick={() => cancelOrder(o.id)}>
-                        Cancel
-                      </button>
-                    ) : (
-                      <span style={{ opacity: 0.6 }}>—</span>
-                    )}
-
-                    {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? (
-                      <span style={{ opacity: 0.6 }}>Refunded</span>
-                    ) : String(o.status || "").toUpperCase() === "CANCELLED" ? (
-                      <button className="btn" onClick={() => markRefunded(o.id)}>
-                        Refund
-                      </button>
-                    ) : (
-                      <span style={{ opacity: 0.6 }}>—</span>
-                    )}
-
-                    <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }}>Ship with Shippo</button>
-                    <button className="btn" onClick={() => toggleOrderHistory(o.id)}>
-                      {orderEventsOpen[o.id] ? "Hide history" : "View history"}
-                    </button>
-                  </div>
-                </td>
-              </tr>
-
-                  {/* HISTORY */}
-                  {orderEventsOpen[o.id] && (
-                    <tr>
-                      <td colSpan={8} style={{ padding: 10 }}>
-                        <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-                          <div style={{ fontWeight: 800, marginBottom: 10 }}>
-                            Order History
-                          </div>
-
-                          {orderEventsLoading[o.id] ? (
-                            <div style={{ opacity: 0.7 }}>Loading history...</div>
-                          ) : (orderEventsById[o.id] || []).length === 0 ? (
-                            <div style={{ opacity: 0.7 }}>No history available.</div>
-                          ) : (
-                            <div style={{ display: "grid", gap: 10 }}>
-                              {orderEventsById[o.id].map((ev) => (
-                                <div
-                                  key={ev.id}
-                                  style={{
-                                    border: "1px solid var(--border)",
-                                    borderRadius: 10,
-                                    padding: 10,
-                                    background: "var(--card)",
-                                  }}
-                                >
-                                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                                    <div style={{ fontWeight: 700 }}>
-                                      {formatOrderEventLabel(ev)}
-                                    </div>
-                                    <div style={{ opacity: 0.7, fontSize: 12 }}>
-                                      {formatEventDate(ev.createdAt)}
-                                    </div>
-                                  </div>
-
-                                  <div style={{ marginTop: 6, opacity: 0.8, fontSize: 12 }}>
-                                    By: {formatEventActor(ev)}
-                                  </div>
-
-                                  {ev.message && (
-                                    <div style={{ marginTop: 6, fontSize: 13 }}>
-                                      {ev.message}
-                                    </div>
-                                  )}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
-              ))}
-
-              {!filteredOrders?.length && (
-                <tr>
-                  <td colSpan={8} style={{ padding: 10, opacity: 0.7 }}>
-                    No orders found.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
+  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
+    <div>
+      <div style={{ fontWeight: 800, fontSize: 21 }}>Manage Orders</div>
+      <div style={{ color: "#64748b", fontSize: 13, marginTop: 4 }}>{filteredOrders.length} orders shown</div>
     </div>
+    <button className="btn" onClick={loadOrders} disabled={ordersLoading}>Refresh</button>
+  </div>
+  {ordersLoading ? <p>Loading orders...</p> : (
+    <div style={{ display: "grid", gap: 12 }}>
+      {filteredOrders.map(o => {
+        let items = [];
+        try { items = JSON.parse(o.itemsJson || "[]"); } catch {}
+        if (!Array.isArray(items)) items = [];
+        const detailsOpen = Boolean(expandedOrderDetails[o.id]);
+        const status = String(o.status || o.paymentStatus || "PENDING").toUpperCase();
+        const paid = String(o.paymentStatus || "").toUpperCase() === "PAID";
+        return <div key={o.id} style={{ border: "1px solid #e2e8f0", borderRadius: 14, padding: 18, background: "#fff" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div style={{ flex: "1 1 250px", minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <strong style={{ fontSize: 17 }}>{o.orderNumber || o.invoiceId}</strong>
+                <span style={{ fontSize: 12, fontWeight: 700, borderRadius: 20, padding: "4px 10px", background: status === "CANCELLED" ? "#fee2e2" : paid ? "#dcfce7" : "#fef3c7", color: status === "CANCELLED" ? "#991b1b" : paid ? "#166534" : "#92400e" }}>{status}</span>
+              </div>
+              <div style={{ color: "#475569", marginTop: 7, overflowWrap: "anywhere" }}>{o.email || "Customer email unavailable"}</div>
+              <div style={{ color: "#64748b", fontSize: 12, marginTop: 5 }}>{o.createdAt ? new Date(o.createdAt).toLocaleDateString() : ""} · {o.paymentMethod || "Payment not specified"}</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 12, color: "#64748b" }}>Order total</div>
+              <strong style={{ fontSize: 22 }}>${Number(o.grandTotal || 0).toFixed(2)}</strong>
+            </div>
+          </div>
+          <div style={{ marginTop: 14, padding: "12px 14px", borderRadius: 10, background: "#f8fafc" }}>
+            <div style={{ fontSize: 12, color: "#64748b", fontWeight: 700, marginBottom: 7 }}>PRODUCTS · {items.reduce((sum, item) => sum + Number(item.qty || item.quantity || 1), 0)} units</div>
+            {items.length ? items.slice(0, 2).map((item, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "4px 0" }}>
+              <span style={{ overflowWrap: "anywhere" }}>{item.name || item.title || item.sku || "Product"}{item.sku ? <span style={{ color: "#64748b", fontSize: 12 }}> · SKU {item.sku}</span> : null}</span>
+              <strong style={{ whiteSpace: "nowrap" }}>× {item.qty || item.quantity || 1}</strong>
+            </div>) : <span style={{ color: "#64748b" }}>No item details available</span>}
+            {items.length > 2 && <div style={{ color: "#64748b", fontSize: 12, marginTop: 5 }}>+ {items.length - 2} more products — view details below</div>}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
+            <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
+            <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
+            <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
+          </div>
+          {detailsOpen && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, fontSize: 13 }}>
+              {[
+                ["Invoice", o.invoiceId], ["Tax", `$${Number(o.tax || 0).toFixed(2)}`],
+                ["Shipping", `$${Number(o.shipping || 0).toFixed(2)}`],
+                ["Cost", `$${Number(o.cost || 0).toFixed(2)}`],
+                ["Profit", `$${Number(o.profit || 0).toFixed(2)}`],
+                ["Payment status", o.paymentStatus]
+              ].map(([label, value]) => <div key={label}><div style={{ color: "#64748b" }}>{label}</div><strong>{value || "—"}</strong></div>)}
+            </div>
+            {items.length > 2 && <div style={{ marginTop: 14 }}>{items.slice(2).map((item, i) => <div key={i} style={{ padding: "5px 0" }}>{item.name || item.sku || "Product"} · Qty {item.qty || item.quantity || 1}</div>)}</div>}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
+              {status === "CANCEL_REQUESTED" ? <>
+                <button className="btn" onClick={() => approveCancelOrder(o.id)}>Approve cancellation</button>
+                <button className="btn" onClick={() => rejectCancelOrder(o.id)}>Reject cancellation</button>
+              </> : status !== "CANCELLED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
+              {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <button className="btn" onClick={() => markRefunded(o.id)}>Refund</button> : null}
+            </div>
+          </div>}
+          {orderEventsOpen[o.id] && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
+            <strong>Order history</strong>
+            {orderEventsLoading[o.id] ? <p>Loading history...</p> : !(orderEventsById[o.id] || []).length ? <p>No history available.</p> : (orderEventsById[o.id] || []).map(ev => <div key={ev.id} style={{ marginTop: 10, padding: 10, background: "#f8fafc", borderRadius: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}><strong>{formatOrderEventLabel(ev)}</strong><small>{formatEventDate(ev.createdAt)}</small></div>
+              <small>By: {formatEventActor(ev)}</small>
+              {ev.message && <div style={{ marginTop: 4 }}>{ev.message}</div>}
+            </div>)}
+          </div>}
+        </div>;
+      })}
+      {!filteredOrders.length && <div style={{ textAlign: "center", padding: 32, color: "#64748b" }}>No orders found.</div>}
+    </div>
+  )}
+</div>
   </>
 )}
 {/* =========================
