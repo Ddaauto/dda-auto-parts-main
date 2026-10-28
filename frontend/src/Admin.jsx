@@ -149,6 +149,7 @@ const [orderEventsById, setOrderEventsById] = useState({});
 const [orderEventsOpen, setOrderEventsOpen] = useState({});
 const [orderEventsLoading, setOrderEventsLoading] = useState({});
 const [orderSearch, setOrderSearch] = useState("");
+const [expandedOrderDetails, setExpandedOrderDetails] = useState({});
 const [dashboardStats, setDashboardStats] = useState({
   totalOrders: 0,
   revenue: 0,
