@@ -62,6 +62,7 @@ export default function Admin() {
   const [loginErr, setLoginErr] = useState("");
 
   const [adminTab, setAdminTab] = useState("products");
+  const [shippoOrderId, setShippoOrderId] = useState(null);
   
 const [quotes, setQuotes] = useState([]);
 const [quotesLoading, setQuotesLoading] = useState(false);
@@ -1190,11 +1191,11 @@ alert("CSV imported successfully");
 
 <button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippingBoxes")}>Shipping Boxes</button>
 <button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippingOrigin")}>Shipping Origin</button>
-<button className="btn" style={{ marginLeft: 10 }} onClick={() => setAdminTab("shippoRates")}>Shippo Rates</button>
+<button className="btn" style={{ marginLeft: 10 }} onClick={() => { setShippoOrderId(null); setAdminTab("shippoRates"); }}>Shippo Rates</button>
 
 {adminTab === "shippingBoxes" && <AdminShippingBoxes api={API_BASE} />}
 {adminTab === "shippingOrigin" && <AdminShippingOrigin api={API_BASE} />}
-{adminTab === "shippoRates" && <AdminShippoRates api={API_BASE} />}
+{adminTab === "shippoRates" && <AdminShippoRates api={API_BASE} orderId={shippoOrderId} />}
 
 {/* =========================
     CUSTOMERS TAB
@@ -1443,6 +1444,7 @@ alert("CSV imported successfully");
                       <span style={{ opacity: 0.6 }}>—</span>
                     )}
 
+                    <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }}>Ship with Shippo</button>
                     <button className="btn" onClick={() => toggleOrderHistory(o.id)}>
                       {orderEventsOpen[o.id] ? "Hide history" : "View history"}
                     </button>

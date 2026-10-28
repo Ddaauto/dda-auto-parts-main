@@ -9,30 +9,42 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin only" });
     next();
   });
-  // Order snapshots preserve the address and items as they were at purchase time.
-  router.get("/orders", (req, res) => {
-    const rows = db.prepare(`SELECT id, orderNumber, invoiceId, createdAt, customerSnapshot, itemsJson, status
-      FROM orders ORDER BY createdAt DESC LIMIT 100`).all();
-    const orders = rows.map(({ customerSnapshot, itemsJson, ...order }) => {
-      let customer = {}, items = [];
-      try { customer = JSON.parse(customerSnapshot || "{}"); } catch {}
-      try { items = JSON.parse(itemsJson || "[]"); } catch {}
-      return { ...order, customer: {
+  const orderSnapshot = id => {
+    const row = db.prepare(`SELECT id, orderNumber, invoiceId, createdAt, customerSnapshot, itemsJson, status FROM orders WHERE id = ?`).get(id);
+    if (!row) return null;
+    let customer = {}, items = [];
+    try { customer = JSON.parse(row.customerSnapshot || "{}"); } catch {}
+    try { items = JSON.parse(row.itemsJson || "[]"); } catch {}
+    return {
+      id: row.id, orderNumber: row.orderNumber, invoiceId: row.invoiceId,
+      createdAt: row.createdAt, status: row.status,
+      customer: {
         name: [customer.firstName, customer.lastName].filter(Boolean).join(" "),
         email: customer.email || "",
         street1: customer.street || customer.address || "",
         city: customer.city || "", state: customer.state || "", zip: customer.zip || "",
-      }, items: Array.isArray(items) ? items.map(item => ({
+      },
+      items: Array.isArray(items) ? items.map(item => ({
         id: item.id, name: item.name || item.title || item.sku || "Product",
         sku: item.sku || "", qty: Number(item.qty || item.quantity || 1),
-      })) : [] };
-    });
-    res.json({ orders });
+      })) : [],
+    };
+  };
+  router.get("/orders/:id", (req, res) => {
+    const order = orderSnapshot(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    res.json({ order });
   });
   router.post("/rates", async (req, res) => {
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured on this server" });
-    const { box, destination } = req.body || {};
+    const { box, orderId } = req.body || {};
+    let destination = req.body?.destination;
+    if (orderId) {
+      const order = orderSnapshot(String(orderId));
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      destination = order.customer;
+    }
     const origin = db.prepare('SELECT * FROM shipping_origin WHERE id = 1').get();
     const positive = v => Number.isFinite(Number(v)) && Number(v) > 0;
     const zip = v => /^\d{5}(?:-\d{4})?$/.test(String(v || ""));
