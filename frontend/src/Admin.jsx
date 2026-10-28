@@ -79,6 +79,7 @@ const [quoteShipping, setQuoteShipping] = useState(0);
 const [quoteShippingId, setQuoteShippingId] = useState("");
 const [quoteShippingOptions, setQuoteShippingOptions] = useState([]);
 
+  const [customers, setCustomers] = useState([]);
   const matchingQuoteCustomers = customers.filter((c) => [c.firstName, c.lastName, c.businessName, c.email, c.phone, c.zip].some((v) => String(v || "").toLowerCase().includes(quoteCustomerSearch.toLowerCase()))).slice(0, 30);
   const quoteSubtotal = quoteItems.reduce((sum, item) => sum + Number(item.qty) * Number(item.price), 0);
   useEffect(() => {
@@ -119,7 +120,6 @@ const [quoteShippingOptions, setQuoteShippingOptions] = useState([]);
     return () => { cancelled = true; clearTimeout(timeout); };
   }, [quoteCustomerId, quoteItems, quoteShippingId]);
 
-  const [customers, setCustomers] = useState([]);
   const [customerSearch, setCustomerSearch] = useState("");
   const [customersLoading, setCustomersLoading] = useState(false);
 const [orders, setOrders] = useState([]);
