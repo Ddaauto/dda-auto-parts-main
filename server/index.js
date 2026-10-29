@@ -3,6 +3,7 @@ import express from "express";
 import createShippingBoxesRouter from "./routes/shippingBoxes.js";
 import createShippoRatesRouter from "./routes/shippoRates.js";
 import createReturnsClaimsRouter from "./routes/returnsClaims.js";
+import createCustomerTrackingRouter from "./routes/customerTracking.js";
 import createShippingOriginRouter from "./routes/shippingOrigin.js";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -1657,6 +1658,7 @@ try { db.exec("ALTER TABLE orders ADD COLUMN deliveredAt TEXT DEFAULT NULL"); } 
   if (!String(e.message || "").includes("duplicate column name")) throw e;
 }
 app.use("/returns-claims", createReturnsClaimsRouter(db, authRequired));
+app.use("/shipping", createCustomerTrackingRouter(db, authRequired));
 app.use("/admin/shipping-origin", createShippingOriginRouter(db, authRequired));
 
 app.get("/admin/customers", authRequired, (req, res) => {
