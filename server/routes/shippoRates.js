@@ -227,7 +227,15 @@ export default function createShippoRatesRouter(db, authRequired) {
       return res.status(502).json({ error: "Purchase outcome requires manual verification in Shippo; do not purchase again.", details: String(error.message || error) });
     }
   });
-  // A refund request only concerns the shipping label, never the customer's order payment.
+  const applyConfirmedLabelRefund = (orderId, labelId, refundId, status) => {
+    db.transaction(() => {
+      db.prepare("UPDATE shipping_labels SET refundStatus = ?, shippoRefundId = ? WHERE id = ? AND orderId = ?").run(status, refundId, labelId, orderId);
+      if (status !== "SUCCESS") return;
+      const otherActive = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND id != ? AND refundStatus != 'SUCCESS' LIMIT 1").get(orderId, labelId);
+      if (!otherActive) db.prepare("UPDATE orders SET status = 'PAID' WHERE id = ? AND status = 'SHIPPED' AND paymentStatus = 'PAID'").run(orderId);
+    })();
+  };
+  // Label refunds never refund the customer payment.
   router.post("/orders/:id/labels/:labelId/request-refund", async (req, res) => {
     if (req.body?.confirm !== true) return res.status(400).json({ error: "Explicit refund request confirmation required" });
     const label = db.prepare("SELECT * FROM shipping_labels WHERE id = ? AND orderId = ?").get(req.params.labelId, req.params.id);
@@ -252,9 +260,8 @@ export default function createShippoRatesRouter(db, authRequired) {
         return res.status(502).json({ error: "Shippo did not accept or confirm the refund. Check Shippo before retrying.", details: result.detail || result.messages || null });
       }
       const status = String(result.status || "PENDING").toUpperCase();
-      db.prepare("UPDATE shipping_labels SET refundStatus = ?, shippoRefundId = ? WHERE id = ?")
-        .run(status, String(result.object_id || ""), label.id);
-      return res.json({ ok: true, refundStatus: status, refundId: result.object_id || null, message: "Refund request submitted; approval is not guaranteed. Order and customer payment are unchanged." });
+      applyConfirmedLabelRefund(label.orderId, label.id, String(result.object_id || ""), status);
+      return res.json({ ok: true, refundStatus: status, refundId: result.object_id || null, message: status === "SUCCESS" ? "Shippo confirmed refund. Order returns to Unshipped if no other active labels. Customer payment unchanged." : "Refund requested; order stays Shipped until Shippo confirms success." });
     } catch {
       db.prepare("UPDATE shipping_labels SET refundStatus = 'REFUND_REVIEW' WHERE id = ?").run(label.id);
       return res.status(502).json({ error: "Refund outcome is uncertain. Verify in Shippo before any retry." });
@@ -273,8 +280,8 @@ export default function createShippoRatesRouter(db, authRequired) {
       const result = await response.json().catch(() => ({}));
       if (!response.ok) return res.status(502).json({ error: "Could not check refund status in Shippo" });
       const status = String(result.status || label.refundStatus).toUpperCase();
-      db.prepare("UPDATE shipping_labels SET refundStatus = ? WHERE id = ?").run(status, label.id);
-      return res.json({ refundStatus: status, message: "Customer order status and payment were not changed." });
+      applyConfirmedLabelRefund(label.orderId, label.id, label.shippoRefundId, status);
+      return res.json({ refundStatus: status, message: status === "SUCCESS" ? "Shippo confirmed refund. Order returns to Unshipped if no other active labels. Customer payment unchanged." : "Refund status updated. Customer payment unchanged." });
     } catch { return res.status(502).json({ error: "Could not reach Shippo" }); }
   });
   return router;
