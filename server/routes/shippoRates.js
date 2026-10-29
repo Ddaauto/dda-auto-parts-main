@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { randomUUID } from "node:crypto";
 import { plannedShipDate, addBusinessDays } from "../shippingCalendar.js";
 
 // Admin-only shipping rates and explicitly confirmed label purchase.
@@ -178,6 +179,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     const rateId = String(req.body?.rateId || "");
     const confirmed = req.body?.confirm === true;
     if (!confirmed || !rateId) return res.status(400).json({ error: "Explicit label purchase confirmation and rateId required" });
+    if (req.body?.hazmat === true) return res.status(422).json({ error: "Hazmat shipping requires carrier-specific dangerous goods validation and compliant labels. Do not purchase a standard label for this shipment." });
     const order = db.prepare("SELECT id, status FROM orders WHERE id = ?").get(orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
     if (String(order.status).toUpperCase() !== "PAID") return res.status(409).json({ error: "Order is not eligible for shipping; resolve cancellation requests first" });
@@ -189,7 +191,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured" });
     // Persist a purchase reservation BEFORE contacting Shippo to prevent accidental double charges.
-    const reservationId = "pending-" + orderId;
+    const reservationId = "pending-" + randomUUID();
     try {
       db.prepare(`INSERT INTO shipping_labels
         (id, orderId, shippoTransactionId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, purchasedAt, refundStatus)
@@ -231,7 +233,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     db.transaction(() => {
       db.prepare("UPDATE shipping_labels SET refundStatus = ?, shippoRefundId = ? WHERE id = ? AND orderId = ?").run(status, refundId, labelId, orderId);
       if (!["PENDING", "SUCCESS"].includes(status)) return;
-      const otherActive = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND id != ? AND refundStatus != 'SUCCESS' LIMIT 1").get(orderId, labelId);
+      const otherActive = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND id != ? AND refundStatus NOT IN ('PENDING', 'SUCCESS') LIMIT 1").get(orderId, labelId);
       if (!otherActive) db.prepare("UPDATE orders SET status = 'PAID' WHERE id = ? AND status = 'SHIPPED' AND paymentStatus = 'PAID'").run(orderId);
     })();
   };
