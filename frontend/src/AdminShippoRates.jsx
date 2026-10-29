@@ -41,10 +41,31 @@ export default function AdminShippoRates({ api, orderId = null }) {
   const formatDate = value => value ? new Date(`${value}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }) : null;
   const sortedRates = [...(rates?.rates || [])].sort((a, b) => Number(a.amount) - Number(b.amount));
   const [busy, setBusy] = useState(false);
+  const [purchasing, setPurchasing] = useState(false);
+  const [purchaseResult, setPurchaseResult] = useState(null);
+  const purchaseLabel = async rate => {
+    if (!orderId || !selectedOrder || purchasing) return;
+    if (rate.test) { setError("Test rates cannot be purchased here."); return; }
+    const confirmed = window.confirm(`Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and moves the order to Shipped.`);
+    if (!confirmed) return;
+    setPurchasing(true); setError("");
+    try {
+      const res = await fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}/purchase-label`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
+        body: JSON.stringify({ rateId: rate.id, expectedAmount: rate.amount, expectedCurrency: rate.currency, confirm: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Purchase could not be confirmed");
+      setPurchaseResult(data);
+      setRates(null);
+    } catch (err) { setError(err.message); }
+    finally { setPurchasing(false); }
+  };
   const update = (key, value) => setForm(old => ({ ...old, [key]: value }));
   const submit = async e => {
     e.preventDefault();
-    setBusy(true); setError(""); setRates(null);
+    setBusy(true); setError(""); setRates(null); setPurchaseResult(null);
     try {
       const token = localStorage.getItem("token") || "";
       const res = await fetch(`${api}/admin/shippo/rates`, {
@@ -73,7 +94,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
   </label>;
   return <div className="card" style={{ marginTop: 16 }}>
     <h2>Shippo – Live shipping rates</h2>
-    <p>Admin preview only. Enter verified package dimensions and total packed weight. No label is purchased and no order is changed.</p>
+    <p>Enter verified package dimensions and packed weight. Looking up rates is free; purchasing a label requires separate confirmation.</p>
     <section style={{ margin: "20px 0", padding: 20, background: "#f8fafc", borderRadius: 12 }}>
       <h3 style={{ marginTop: 0 }}>Order details</h3>
       {orderId && !selectedOrder && !ordersError && <p>Loading selected order...</p>}
@@ -110,6 +131,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
       </button>
     </form>
     {error && <p role="alert" style={{ color: "#dc2626" }}>{error}</p>}
+    {purchaseResult && <div role="status" style={{ padding: 16, background: "#ecfdf5", borderRadius: 10, marginTop: 16 }}><strong>Shipping label purchased. Order moved to Shipped.</strong><p>Tracking: {purchaseResult.trackingNumber || "Not provided"}</p>{purchaseResult.labelUrl && <a href={purchaseResult.labelUrl} target="_blank" rel="noopener noreferrer">Open / Print label PDF</a>}</div>}
     {rates && <div style={{ marginTop: 16 }}>
       <h3>Available rates {rates.rates?.length ? `(${rates.rates.length})` : ""}</h3>
       {!rates.rates?.length && <p>No rates returned for this package and address.</p>}
@@ -118,7 +140,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
       <div style={{ overflowX: "auto", marginTop: 16 }}>
         <table style={{ width: "100%", textAlign: "left", borderCollapse: "separate", borderSpacing: "0 8px", minWidth: 680 }}>
           <thead><tr style={{ color: "#475569" }}>
-            {["Carrier", "Service", "Price", "Estimated delivery", "Mode"].map(label =>
+            {["Carrier", "Service", "Price", "Estimated delivery", "Mode", ...(orderId ? ["Action"] : [])].map(label =>
               <th key={label} style={{ padding: "12px 18px", fontSize: 13, fontWeight: 700 }}>{label}</th>)}
           </tr></thead>
           <tbody>{sortedRates.map((rate, index) => <tr key={rate.id || index} style={{ background: index === 0 ? "#ecfdf5" : "#f8fafc" }}>
@@ -127,10 +149,11 @@ export default function AdminShippoRates({ api, orderId = null }) {
             <td style={{ padding: "18px", fontWeight: 800, fontSize: 17, whiteSpace: "nowrap" }}>{Number(rate.amount).toFixed(2)} {rate.currency}</td>
             <td style={{ padding: "18px" }}>{rate.estimatedDeliveryStart && rate.estimatedDeliveryEnd ? <><strong>{formatDate(rate.estimatedDeliveryStart)} – {formatDate(rate.estimatedDeliveryEnd)}</strong><div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>Approx. {rate.estimatedDays} transit days + buffer</div></> : "Not provided"}</td>
             <td style={{ padding: "18px", borderRadius: "0 10px 10px 0" }}>{rate.test ? "Test" : "Live"}</td>
+            {orderId && <td style={{ padding: "18px" }}><button className="btn btnPrimary" type="button" disabled={purchasing || rate.test} onClick={() => purchaseLabel(rate)}>{purchasing ? "Processing..." : "Buy label"}</button></td>}
           </tr>)}</tbody>
         </table>
       </div>
-      <p>Rates only. Labels have not been purchased.</p>
+      <p>Rates are not purchases. A label is charged only after you click Buy label and confirm.</p>
     </div>}
   </div>;
 }
