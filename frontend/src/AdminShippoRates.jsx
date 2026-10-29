@@ -42,10 +42,12 @@ export default function AdminShippoRates({ api, orderId = null }) {
   const sortedRates = [...(rates?.rates || [])].sort((a, b) => Number(a.amount) - Number(b.amount));
   const [busy, setBusy] = useState(false);
   const [purchasing, setPurchasing] = useState(false);
+  const [hazmat, setHazmat] = useState(false);
   const [purchaseResult, setPurchaseResult] = useState(null);
   const purchaseLabel = async rate => {
     if (!orderId || !selectedOrder || purchasing) return;
     if (rate.test) { setError("Test rates cannot be purchased here."); return; }
+    if (hazmat) { setError("Hazmat labels require carrier-specific compliance configuration. Standard label purchase is blocked for safety."); return; }
     const confirmed = window.confirm(`Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and moves the order to Shipped.`);
     if (!confirmed) return;
     setPurchasing(true); setError("");
@@ -53,7 +55,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
       const res = await fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}/purchase-label`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
-        body: JSON.stringify({ rateId: rate.id, expectedAmount: rate.amount, expectedCurrency: rate.currency, confirm: true }),
+        body: JSON.stringify({ rateId: rate.id, expectedAmount: rate.amount, expectedCurrency: rate.currency, confirm: true, hazmat }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Purchase could not be confirmed");
@@ -109,6 +111,8 @@ export default function AdminShippoRates({ api, orderId = null }) {
     </section>
     <form onSubmit={submit} style={{ display: "grid", gap: 12 }}>
       <h3>Package (inches / ounces)</h3>
+      <label style={{ display: "flex", gap: 10, alignItems: "center", fontWeight: 600 }}><input type="checkbox" checked={hazmat} onChange={e => setHazmat(e.target.checked)} /> Hazmat / Dangerous Goods</label>
+      {hazmat && <p role="alert" style={{ color: "#92400e" }}>Dangerous goods shipment: standard label purchase is disabled until carrier-specific hazmat service, classification, and labeling are configured and validated.</p>}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         {field("lengthIn", "Length (in)", "number")}
         {field("widthIn", "Width (in)", "number")}
@@ -149,7 +153,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
             <td style={{ padding: "18px", fontWeight: 800, fontSize: 17, whiteSpace: "nowrap" }}>{Number(rate.amount).toFixed(2)} {rate.currency}</td>
             <td style={{ padding: "18px" }}>{rate.estimatedDeliveryStart && rate.estimatedDeliveryEnd ? <><strong>{formatDate(rate.estimatedDeliveryStart)} – {formatDate(rate.estimatedDeliveryEnd)}</strong><div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>Approx. {rate.estimatedDays} transit days + buffer</div></> : "Not provided"}</td>
             <td style={{ padding: "18px", borderRadius: "0 10px 10px 0" }}>{rate.test ? "Test" : "Live"}</td>
-            {orderId && <td style={{ padding: "18px" }}><button className="btn btnPrimary" type="button" disabled={purchasing || rate.test} onClick={() => purchaseLabel(rate)}>{purchasing ? "Processing..." : "Buy label"}</button></td>}
+            {orderId && <td style={{ padding: "18px" }}><button className="btn btnPrimary" type="button" disabled={purchasing || rate.test || hazmat} onClick={() => purchaseLabel(rate)}>{purchasing ? "Processing..." : "Buy label"}</button></td>}
           </tr>)}</tbody>
         </table>
       </div>
