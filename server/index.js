@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import createShippingBoxesRouter from "./routes/shippingBoxes.js";
 import createShippoRatesRouter from "./routes/shippoRates.js";
+import createReturnsClaimsRouter from "./routes/returnsClaims.js";
 import createShippingOriginRouter from "./routes/shippingOrigin.js";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -1651,6 +1652,7 @@ app.get("/auth/me", authRequired, (req, res) => {
 // =====================================================
 app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
 app.use("/admin/shippo", createShippoRatesRouter(db, authRequired));
+app.use("/returns-claims", createReturnsClaimsRouter(db, authRequired));
 app.use("/admin/shipping-origin", createShippingOriginRouter(db, authRequired));
 
 app.get("/admin/customers", authRequired, (req, res) => {
