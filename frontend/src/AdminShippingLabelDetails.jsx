@@ -4,6 +4,25 @@ export default function AdminShippingLabelDetails({ api, orderId }) {
   const [labels, setLabels] = useState([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState("");
+  const [message, setMessage] = useState("");
+  const act = async (label, action) => {
+    if (busyId) return;
+    if (action === "request-refund" && !window.confirm("Request cancellation/refund of this SHIPPING LABEL from Shippo? Approval is not guaranteed. This does NOT cancel the customer's order or refund their purchase.")) return;
+    setBusyId(label.id); setError(""); setMessage("");
+    try {
+      const response = await fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}/labels/${encodeURIComponent(label.id)}/${action}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}`, "Content-Type": "application/json" },
+        body: JSON.stringify(action === "request-refund" ? { confirm: true } : {}),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Shippo request failed");
+      setLabels(old => old.map(item => item.id === label.id ? { ...item, refundStatus: data.refundStatus } : item));
+      setMessage(data.message || "Shippo status updated.");
+    } catch (err) { setError(err.message); }
+    finally { setBusyId(""); }
+  };
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -19,9 +38,11 @@ export default function AdminShippingLabelDetails({ api, orderId }) {
     return () => { active = false; };
   }, [api, orderId]);
   if (loading) return <p>Loading shipping labels...</p>;
-  if (error) return <p role="alert" style={{ color: "#b91c1c" }}>{error}</p>;
+
   if (!labels.length) return <p style={{ color: "#64748b" }}>No Shippo label is recorded for this order yet. Label printing and refunds will be available after purchasing a label through DDA.</p>;
   return <div style={{ display: "grid", gap: 12 }}>
+    {error && <p role="alert" style={{ color: "#b91c1c" }}>{error}</p>}
+    {message && <p role="status" style={{ color: "#166534" }}>{message}</p>}
     {labels.map(label => <div key={label.id} style={{ padding: 16, border: "1px solid #e2e8f0", borderRadius: 10, background: "#f8fafc" }}>
       <strong>{label.carrier} — {label.service}</strong>
       <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
@@ -34,8 +55,10 @@ export default function AdminShippingLabelDetails({ api, orderId }) {
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 14 }}>
         {label.labelUrl && <a className="btn" href={label.labelUrl} target="_blank" rel="noopener noreferrer">Reprint Label</a>}
         {label.trackingUrl && <a className="btn" href={label.trackingUrl} target="_blank" rel="noopener noreferrer">Track shipment</a>}
+        {!label.refundStatus && label.labelUrl && <button className="btn" type="button" disabled={Boolean(busyId)} onClick={() => act(label, "request-refund")}>{busyId === label.id ? "Submitting..." : "Request label refund"}</button>}
+        {label.shippoRefundId && <button className="btn" type="button" disabled={Boolean(busyId)} onClick={() => act(label, "refresh-refund")}>{busyId === label.id ? "Checking..." : "Refresh refund status"}</button>}
       </div>
-      <small style={{ display: "block", marginTop: 10, color: "#64748b" }}>Label cancellation/refund requires carrier eligibility and Shippo confirmation. No refund is initiated from this screen yet.</small>
+      <small style={{ display: "block", marginTop: 10, color: "#64748b" }}>Shippo decides refund eligibility. A refund request does not cancel the customer order or refund their payment. Do not reuse the label while its refund is pending.</small>
     </div>)}
   </div>;
 }
