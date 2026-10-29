@@ -58,7 +58,7 @@ export default function AdminShippingLabelDetails({ api, orderId }) {
         {!label.refundStatus && label.labelUrl && <button className="btn" type="button" disabled={Boolean(busyId)} onClick={() => act(label, "request-refund")}>{busyId === label.id ? "Submitting..." : "Request label refund"}</button>}
         {label.shippoRefundId && <button className="btn" type="button" disabled={Boolean(busyId)} onClick={() => act(label, "refresh-refund")}>{busyId === label.id ? "Checking..." : "Refresh refund status"}</button>}
       </div>
-      <small style={{ display: "block", marginTop: 10, color: "#64748b" }}>Shippo decides refund eligibility. A refund request does not cancel the customer order or refund their payment. Do not reuse the label while its refund is pending.</small>
+      <small style={{ display: "block", marginTop: 10, color: "#64748b" }}>Shippo decides refund eligibility. Once Shippo accepts the refund request, the order returns to Unshipped so you can purchase a replacement label. The refund may remain pending for days. Customer payment is unchanged.</small>
     </div>)}
   </div>;
 }
