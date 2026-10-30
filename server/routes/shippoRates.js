@@ -36,12 +36,40 @@ export default function createShippoRatesRouter(db, authRequired) {
     lengthIn REAL NOT NULL, widthIn REAL NOT NULL, heightIn REAL NOT NULL, weightOz REAL NOT NULL,
     expiresAt TEXT NOT NULL
   )`);
+  for (const ddl of [
+    "ALTER TABLE shipping_labels ADD COLUMN packageItemsJson TEXT DEFAULT '[]'",
+    "ALTER TABLE shippo_rate_quotes ADD COLUMN packageItemsJson TEXT DEFAULT '[]'"
+  ]) { try { db.exec(ddl); } catch (e) { if (!String(e.message).includes("duplicate column name")) throw e; } }
+  const purchasedLabels = id => db.prepare("SELECT * FROM shipping_labels WHERE orderId = ? AND COALESCE(refundStatus,'') NOT IN ('SUCCESS','REFUNDED')").all(id);
+  const packageAllocation = (order, input, multi) => {
+    const totals = new Map(order.items.map(item => [String(item.id || item.sku), Number(item.qty)]));
+    if (!multi) return { items: order.items.map(item => ({ key: String(item.id || item.sku), qty: Number(item.qty) })) };
+    if (!Array.isArray(input) || !input.length) return { error: "Choose quantities for this package" };
+    const selected = new Map();
+    for (const item of input) {
+      const key = String(item.key || "");
+      const qty = Number(item.qty);
+      if (!totals.has(key) || !Number.isSafeInteger(qty) || qty < 1 || selected.has(key)) return { error: "Invalid package item allocation" };
+      selected.set(key, qty);
+    }
+    const allocated = new Map();
+    for (const label of purchasedLabels(order.id)) {
+      if (["PURCHASING","PURCHASE_REVIEW"].includes(label.refundStatus)) return { error: "Previous purchase requires manual review" };
+      let parts; try { parts = JSON.parse(label.packageItemsJson || "[]"); } catch { return { error: "Existing package allocation needs review" }; }
+      if (!parts.length) return { error: "Existing label lacks package allocation; manual review required" };
+      for (const part of parts) allocated.set(part.key, (allocated.get(part.key) || 0) + Number(part.qty));
+    }
+    for (const [key, qty] of selected) {
+      if (qty + (allocated.get(key) || 0) > totals.get(key)) return { error: "Package quantity exceeds unshipped quantity" };
+    }
+    return { items: [...selected].map(([key, qty]) => ({ key, qty })) };
+  };
   router.get("/orders/:id/labels", (req, res) => {
     const exists = db.prepare("SELECT id FROM orders WHERE id = ?").get(req.params.id);
     if (!exists) return res.status(404).json({ error: "Order not found" });
     const labels = db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
       labelUrl, amount, currency, lengthIn, widthIn, heightIn, weightOz,
-      purchasedAt, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
+      purchasedAt, refundStatus, packageItemsJson FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
     res.json({ labels });
   });
   const orderSnapshot = id => {
@@ -78,9 +106,14 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (orderId) {
       const order = orderSnapshot(String(orderId));
       if (!order) return res.status(404).json({ error: "Order not found" });
-      if (String(order.status).toUpperCase() !== "PAID") return res.status(409).json({ error: "Only paid, uncanceled, unshipped orders can receive labels" });
-      const existing = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND refundStatus != 'SUCCESS' LIMIT 1").get(order.id);
-      if (existing) return res.status(409).json({ error: "This order already has a shipping label" });
+      const multi = req.body?.multiPackage === true;
+      if (!["PAID","LABEL_CREATED"].includes(String(order.status).toUpperCase()) || (order.status === "LABEL_CREATED" && !multi))
+        return res.status(409).json({ error: "Order is not eligible for this shipping mode" });
+      const existing = purchasedLabels(order.id);
+      if (existing.length && !multi) return res.status(409).json({ error: "Existing labels require multi-package mode" });
+      const allocation = packageAllocation(order, req.body?.packageItems, multi);
+      if (allocation.error) return res.status(409).json({ error: allocation.error });
+      req.packageAllocation = allocation.items;
       destination = order.customer;
     }
     const origin = db.prepare('SELECT * FROM shipping_origin WHERE id = 1').get();
@@ -133,14 +166,14 @@ export default function createShippoRatesRouter(db, authRequired) {
       }
       if (orderId) {
         const save = db.prepare(`INSERT OR REPLACE INTO shippo_rate_quotes
-          (rateId, orderId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, expiresAt)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+          (rateId, orderId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, expiresAt, packageItemsJson)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
         db.transaction(() => {
           for (const rate of data.rates || []) {
             if (!rate.object_id || rate.test === true) continue;
             save.run(rate.object_id, String(orderId), String(rate.provider || ""), String(rate.servicelevel?.name || ""), String(rate.amount || ""), String(rate.currency || "USD"),
-              Number(box.lengthIn), Number(box.widthIn), Number(box.heightIn), Number(box.weightOz), expiresAt);
+              Number(box.lengthIn), Number(box.widthIn), Number(box.heightIn), Number(box.weightOz), expiresAt, JSON.stringify(req.packageAllocation || []));
           }
         })();
       }
@@ -178,22 +211,28 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (!confirmed || !rateId) return res.status(400).json({ error: "Explicit label purchase confirmation and rateId required" });
     const order = db.prepare("SELECT id, status FROM orders WHERE id = ?").get(orderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    if (String(order.status).toUpperCase() !== "PAID") return res.status(409).json({ error: "Order is not eligible for shipping; resolve cancellation requests first" });
+    if (!["PAID","LABEL_CREATED"].includes(String(order.status).toUpperCase())) return res.status(409).json({ error: "Order is not eligible for shipping; resolve cancellation requests first" });
     const quote = db.prepare("SELECT * FROM shippo_rate_quotes WHERE rateId = ? AND orderId = ?").get(rateId, orderId);
     if (!quote || new Date(quote.expiresAt).getTime() < Date.now()) return res.status(409).json({ error: "Rate expired; request new Shippo rates" });
     if (req.body?.expectedAmount !== quote.amount || req.body?.expectedCurrency !== quote.currency) return res.status(409).json({ error: "Rate amount confirmation mismatch" });
-    if (db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND refundStatus != 'SUCCESS' LIMIT 1").get(orderId))
-      return res.status(409).json({ error: "An active label already exists for this order" });
+    const existingLabels = purchasedLabels(orderId);
+    if (existingLabels.some(label => ["PURCHASING","PURCHASE_REVIEW"].includes(label.refundStatus)))
+      return res.status(409).json({ error: "Prior label purchase needs manual review" });
+    if (existingLabels.length && req.body?.multiPackage !== true)
+      return res.status(409).json({ error: "Explicit multi-package confirmation required" });
+    const currentOrder = orderSnapshot(orderId);
+    const allocation = packageAllocation(currentOrder, JSON.parse(quote.packageItemsJson || "[]"), existingLabels.length > 0 || req.body?.multiPackage === true);
+    if (allocation.error) return res.status(409).json({ error: allocation.error });
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured" });
     // Persist a purchase reservation BEFORE contacting Shippo to prevent accidental double charges.
-    const reservationId = "pending-" + orderId;
+    const reservationId = "pending-" + rateId;
     try {
       db.prepare(`INSERT INTO shipping_labels
-        (id, orderId, shippoTransactionId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, purchasedAt, refundStatus)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PURCHASING')`)
+        (id, orderId, shippoTransactionId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, purchasedAt, refundStatus, packageItemsJson)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PURCHASING', ?)`)
         .run(reservationId, orderId, reservationId, quote.carrier, quote.service, quote.amount, quote.currency,
-          quote.lengthIn, quote.widthIn, quote.heightIn, quote.weightOz, new Date().toISOString());
+          quote.lengthIn, quote.widthIn, quote.heightIn, quote.weightOz, new Date().toISOString(), JSON.stringify(allocation.items));
     } catch {
       return res.status(409).json({ error: "Label purchase is already in progress or exists; contact support before retrying" });
     }
@@ -215,7 +254,7 @@ export default function createShippoRatesRouter(db, authRequired) {
           trackingUrl = ?, purchasedAt = ?, refundStatus = '' WHERE id = ?`)
           .run(result.object_id, result.label_url, result.tracking_number || "",
             result.tracking_url_provider || "", new Date().toISOString(), reservationId);
-        const changed = db.prepare("UPDATE orders SET status = 'LABEL_CREATED' WHERE id = ? AND status = 'PAID'").run(orderId);
+        const changed = db.prepare("UPDATE orders SET status = 'LABEL_CREATED' WHERE id = ? AND status IN ('PAID','LABEL_CREATED')").run(orderId);
         if (changed.changes !== 1) throw new Error("Order changed while purchasing label");
         db.prepare("DELETE FROM shippo_rate_quotes WHERE orderId = ?").run(orderId);
       })();
