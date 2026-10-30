@@ -50,6 +50,24 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       // Only settle our own tracked refund; never infer completion from a charge event.
       if (event.type === "charge.refunded") return res.json({ received: true });
       const incoming = event.data.object;
+      const batchRefund = db.prepare("SELECT * FROM stripe_shippo_batch_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (batchRefund) {
+        const batchOrder = db.prepare("SELECT status FROM orders WHERE id = ?").get(batchRefund.orderId);
+        if (!batchOrder || batchOrder.status !== "CANCELLED" ||
+            Number(incoming.amount) !== batchRefund.amountCents ||
+            String(incoming.payment_intent || "") !== batchRefund.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Shippo batch refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        db.transaction(() => {
+          const prior = db.prepare("SELECT refundStatus FROM stripe_shippo_batch_refunds WHERE batchId = ?").get(batchRefund.batchId);
+          if (prior?.refundStatus === "succeeded") return;
+          db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = ? WHERE batchId = ?").run(state, batchRefund.batchId);
+          if (state === "succeeded") db.prepare("UPDATE shippo_additional_refund_batches SET status = 'CONFIRMED' WHERE id = ? AND orderId = ? AND status = 'STRIPE_REQUESTED'").run(batchRefund.batchId, batchRefund.orderId);
+        })();
+        return res.json({ received: true });
+      }
       const additional = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE stripeRefundId = ?").get(incoming.id);
       if (additional) {
         const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(additional.orderId);
@@ -913,6 +931,14 @@ CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
 );
 CREATE TABLE IF NOT EXISTS stripe_shippo_additional_refunds (
   orderId TEXT PRIMARY KEY,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING'
+);
+CREATE TABLE IF NOT EXISTS stripe_shippo_batch_refunds (
+  batchId INTEGER PRIMARY KEY,
+  orderId TEXT NOT NULL,
   stripePaymentIntentId TEXT NOT NULL,
   amountCents INTEGER NOT NULL,
   stripeRefundId TEXT UNIQUE,
@@ -2843,6 +2869,76 @@ app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-ze
   } catch (error) {
     console.error("Shippo Zelle batch confirmation failed:", error);
     return res.status(500).json({ error: "Unable to confirm Zelle batch" });
+  }
+});
+// Execute one later Shippo batch refund through Stripe; each batch has its own idempotency key.
+app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit refund confirmation required" });
+    const id = String(req.params.id || "");
+    const batchId = Number(req.params.batchId);
+    if (!Number.isSafeInteger(batchId) || batchId <= 0) return res.status(400).json({ error: "Invalid batch" });
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const initial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(id);
+      const batch = db.prepare("SELECT * FROM shippo_additional_refund_batches WHERE id = ? AND orderId = ?").get(batchId, id);
+      if (!order || !settlement || !initial || !first || !batch ||
+          order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          !["stripe", "card"].includes(settlement.paymentMethod) ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          initial.refundStatus !== "succeeded" || first.refundStatus !== "succeeded" ||
+          batch.status !== "PREPARED" ||
+          String(order.stripePaymentIntentId || "") !== initial.stripePaymentIntentId ||
+          first.stripePaymentIntentId !== initial.stripePaymentIntentId) {
+        return { error: "Stripe batch prerequisites not met", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents),0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const firstRefund = db.prepare("SELECT amountCents FROM shippo_additional_refunds WHERE orderId = ? AND status = 'CONFIRMED'").get(id);
+      const other = db.prepare("SELECT COALESCE(SUM(amountCents),0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ? AND id != ?").get(id, batchId).cents;
+      if (!firstRefund || !Number.isSafeInteger(batch.amountCents) || batch.amountCents <= 0 ||
+          firstRefund.amountCents + other + batch.amountCents > verified ||
+          initial.amountCents + firstRefund.amountCents + other + batch.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Batch exceeds verified refundable funds", code: 409 };
+      }
+      const claimed = db.prepare(`INSERT OR IGNORE INTO stripe_shippo_batch_refunds
+        (batchId, orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?, ?)`
+      ).run(batchId, id, initial.stripePaymentIntentId, batch.amountCents);
+      if (!claimed.changes) return { error: "Stripe refund already attempted for this batch", code: 409 };
+      db.prepare("UPDATE shippo_additional_refund_batches SET status = 'STRIPE_REQUESTED' WHERE id = ? AND status = 'PREPARED'").run(batchId);
+      return { paymentIntentId: initial.stripePaymentIntentId, amountCents: batch.amountCents };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, batchId: String(batchId), kind: "shippo_additional_batch" }
+      }, { idempotencyKey: `dda-shippo-batch-${batchId}` });
+      db.prepare("UPDATE stripe_shippo_batch_refunds SET stripeRefundId = ?, refundStatus = ? WHERE batchId = ?")
+        .run(refund.id, String(refund.status || "pending").toLowerCase(), batchId);
+      try {
+        const verified = await stripe.refunds.retrieve(refund.id);
+        if (verified.id === refund.id && verified.status === "succeeded" &&
+            Number(verified.amount) === claim.amountCents &&
+            String(verified.payment_intent || "") === claim.paymentIntentId) {
+          db.transaction(() => {
+            db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = 'succeeded' WHERE batchId = ?").run(batchId);
+            db.prepare("UPDATE shippo_additional_refund_batches SET status = 'CONFIRMED' WHERE id = ? AND status = 'STRIPE_REQUESTED'").run(batchId);
+          })();
+        }
+      } catch (verifyError) { console.warn("Shippo batch Stripe verification pending", batchId, verifyError.message); }
+      return res.json({ ok: true, batchId, refundId: refund.id, amountCents: claim.amountCents,
+        confirmationPending: db.prepare("SELECT refundStatus FROM stripe_shippo_batch_refunds WHERE batchId = ?").get(batchId).refundStatus !== "succeeded" });
+    } catch (error) {
+      db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = 'REVIEW_REQUIRED' WHERE batchId = ? AND refundStatus != 'succeeded'").run(batchId);
+      console.error("Stripe batch refund reconciliation required", batchId, error);
+      return res.status(202).json({ ok: false, reviewRequired: true, message: "Reconcile Stripe before retrying" });
+    }
+  } catch (error) {
+    console.error("Stripe batch refund endpoint error", error);
+    return res.status(500).json({ error: "Unable to process Stripe batch" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
