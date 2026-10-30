@@ -717,6 +717,22 @@ async function notifyCustomerCancellationStatus(order) {
   const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
   if (!customer?.email) return false;
   const payment = String(order.paymentStatus || "").toUpperCase();
+  const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(order.id);
+  if (settlement) {
+    const money = cents => (Number(cents) / 100).toFixed(2);
+    const number = String(order.orderNumber || order.id);
+    const initialConfirmed = settlement.status === "INITIAL_REFUND_CONFIRMED";
+    const detail = initialConfirmed
+      ? "The initial partial refund has been confirmed."
+      : "The initial partial refund is pending and has not yet been confirmed.";
+    const shippoDetail = "If Shippo later returns the label charge to us, we will review that amount for an additional refund. The $5.00 processing fee is not refundable.";
+    await sendEmail({
+      to: customer.email,
+      subject: `Order cancelled - ${number} | DDA Auto Parts`,
+      text: `Your order ${number} has been cancelled before carrier pickup. ${detail}\n\nOrder payment: ${money(settlement.amountPaidCents)}\nShipping label cost: ${money(settlement.labelCostCents)}\nNon-refundable processing fee: ${money(settlement.processingFeeCents)}\nInitial partial refund: ${money(settlement.initialRefundCents)}\n\n${shippoDetail}`
+    });
+    return true;
+  }
   const detail = payment === "REFUNDED"
     ? "Your refund has been confirmed by the payment processor."
     : payment === "REFUND_PENDING"
