@@ -105,6 +105,11 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           return !!db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(partial.orderId).changes;
         })();
         if (confirmed) logOrderEvent(partial.orderId, "STRIPE_PARTIAL_REFUND_CONFIRMED", "Stripe confirmed initial partial refund", "system", null, { amountCents: partial.amountCents });
+        if (state === "succeeded") {
+          try {
+            await notifyCustomerPartialRefundOnce(partial.orderId, `initial-stripe:${partial.orderId}`, partial.amountCents, "Stripe");
+          } catch (error) { console.error("Stripe partial refund email requires review:", error); }
+        }
         return res.json({ received: true });
       }
       const tracked = db.prepare(
