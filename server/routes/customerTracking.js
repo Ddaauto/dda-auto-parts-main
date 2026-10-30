@@ -52,8 +52,9 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     const order=db.prepare("SELECT id, deliveredAt FROM orders WHERE id = ?").get(req.params.id);
     if(!order)return res.status(404).json({error:"Order not found"});
     const labels=activeLabels(order.id);
-    if (labels.length !== 1) return res.status(409).json({error:"Multiple packages require per-label tracking refresh; no status changed"});
-    const label=labels[0];
+    const selectedId = String(req.body?.labelId || "");
+    if (labels.length > 1 && !selectedId) return res.status(400).json({error:"Select a package labelId to refresh"});
+    const label = selectedId ? labels.find(item => item.id === selectedId) : labels[0];
     if(!label?.carrier || !label?.trackingNumber)return res.status(409).json({error:"No active label with carrier and tracking number"});
     const token=process.env.SHIPPO_API_TOKEN;
     if(!token)return res.status(503).json({error:"Shippo is not configured"});
@@ -69,10 +70,14 @@ export default function createCustomerTrackingRouter(db, authRequired) {
       const deliveryDate=status==="DELIVERED" && rawDate && Number.isFinite(Date.parse(rawDate)) ? new Date(rawDate).toISOString() : null;
       db.transaction(()=>{
         db.prepare("UPDATE shipping_labels SET carrierTrackingStatus = ?, carrierTrackingCheckedAt = ? WHERE id = ?").run(status,now,label.id);
-        if (status === "DELIVERED") {
+        const all = activeLabels(order.id);
+        const deliveredAll = all.length > 0 && all.every(item => item.carrierTrackingStatus === "DELIVERED");
+        const pickedUpAll = all.length > 0 && all.every(item =>
+          ["TRANSIT","OUT_FOR_DELIVERY","DELIVERED","RETURNED","FAILURE"].includes(item.carrierTrackingStatus));
+        if (deliveredAll) {
           db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
           if (deliveryDate) db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate,order.id);
-        } else if (["TRANSIT", "OUT_FOR_DELIVERY", "RETURNED"].includes(status)) {
+        } else if (pickedUpAll) {
           db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
         }
       })();
