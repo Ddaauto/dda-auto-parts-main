@@ -1934,7 +1934,7 @@ totalProfit += subtotal - totalCost;
     res.status(500).json({ error: "Failed to load dashboard" });
   }
 });
-app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
+app.put("/admin/orders/:id/cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
       return res.status(403).json({ error: "Forbidden" });
@@ -1983,7 +1983,14 @@ logOrderEvent(
   "admin",
   req.user?.id ? String(req.user.id) : null
 );
-    return res.json({ ok: true, changes: result.changes });
+    const cancelled = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+    let refund = null;
+    if (String(cancelled?.paymentStatus || "").toUpperCase() === "REFUND_PENDING" &&
+        String(cancelled?.paymentMethod || "").toLowerCase() !== "zelle") {
+      refund = await submitCancelledStripeRefund(cancelled, "admin", req.user?.id ? String(req.user.id) : null);
+      if (!refund.ok) console.warn("Admin cancellation requires Stripe refund review:", id);
+    }
+    return res.json({ ok: true, changes: result.changes, refund });
   } catch (e) {
     console.error("❌ /admin/orders/:id/cancel error:", e);
     return res.status(500).json({ error: "Failed to cancel order" });
