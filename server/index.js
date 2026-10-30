@@ -2012,12 +2012,16 @@ app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
     if (String(refundOrder.paymentMethod || "").toLowerCase() !== "zelle") {
       return res.status(409).json({ error: "Card refunds must be verified through Stripe; this action is for manual Zelle confirmation only" });
     }
+    if (req.body?.refundSentConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm the Zelle refund was actually sent before marking this order refunded", required: "refundSentConfirmed" });
+    }
 
     const result = db.prepare(`
       UPDATE orders
       SET paymentStatus = 'REFUNDED'
-      WHERE id = ?
+      WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
     `).run(id);
+    if (!result.changes) return res.status(409).json({ error: "Refund state changed; refresh the order" });
 logOrderEvent(
   id,
   "ORDER_REFUNDED",
