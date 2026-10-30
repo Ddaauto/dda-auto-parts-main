@@ -226,6 +226,9 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (allocation.error) return res.status(409).json({ error: allocation.error });
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured" });
+    // The selected rate must be allocated to an actual package, and its
+    // quantities must still be available after previous labels.
+    if (!allocation.items.length) return res.status(409).json({ error: "No items assigned to this package" });
     // Persist a purchase reservation BEFORE contacting Shippo to prevent accidental double charges.
     const reservationId = "pending-" + rateId;
     try {
