@@ -1836,7 +1836,7 @@ app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
     const result = db.prepare(`
       UPDATE orders
       SET status = 'CANCELLED',
-          paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' ELSE 'CANCELLED' END
+          paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING' ELSE 'CANCELLED' END
       WHERE id = ? AND status NOT IN ('CANCELLED', 'SHIPPED', 'DELIVERED', 'LABEL_CREATED')
     `).run(id);
     if (!result.changes) return res.status(409).json({ error: "Order is not eligible for direct cancellation" });
@@ -2518,7 +2518,7 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       const result = db.prepare(`
         UPDATE orders
         SET status = 'CANCELLED',
-            paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' ELSE 'CANCELLED' END
+            paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING' ELSE 'CANCELLED' END
         WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')
       `).run(orderId, customerId);
       return { result, status: "CANCELLED" };
@@ -3127,6 +3127,15 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
 
     if (order.paymentStatus === "PAID") {
       return res.status(409).json({ ok: false, error: "Payment already confirmed" });
+    }
+    if (order.status === "CANCELLED" && order.paymentStatus === "PAYMENT_VERIFICATION_PENDING") {
+      const result = db.prepare(`
+        UPDATE orders SET paymentStatus = 'REFUND_PENDING', confirmedBy = ?, confirmedAt = ?
+        WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'PAYMENT_VERIFICATION_PENDING'
+      `).run(String(req.user.email || ""), new Date().toISOString(), id);
+      if (!result.changes) return res.status(409).json({ ok: false, error: "Payment verification state changed" });
+      logOrderEvent(id, "CANCELLED_PAYMENT_CONFIRMED", "Zelle payment arrived after cancellation; manual refund required", "admin", req.user?.id ? String(req.user.id) : null);
+      return res.json({ ok: true, status: "CANCELLED", paymentStatus: "REFUND_PENDING", manualRefundRequired: true });
     }
     if (order.paymentStatus !== "PENDING_ADMIN" || order.status !== "PENDING") {
       return res.status(409).json({ ok: false, error: "Order is not awaiting Zelle confirmation" });
