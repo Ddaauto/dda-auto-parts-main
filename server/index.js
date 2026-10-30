@@ -1825,6 +1825,14 @@ app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
     }
 
     const { id } = req.params;
+    const order = db.prepare("SELECT id, status, paymentStatus FROM orders WHERE id = ?").get(id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(order.status || "").toUpperCase())) {
+      return res.status(409).json({ error: "This order requires shipping-aware cancellation review" });
+    }
+    if (String(order.paymentStatus || "").toUpperCase() === "PAID") {
+      return res.status(409).json({ error: "Paid orders require a verified refund workflow before cancellation" });
+    }
 
     const result = db.prepare(`
       UPDATE orders
@@ -1867,6 +1875,11 @@ app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
 
     if (String(row.status || "").toUpperCase() !== "CANCEL_REQUESTED") {
       return res.status(400).json({ error: "Order is not waiting for cancel approval" });
+    }
+    // A paid order cannot be finalized as cancelled until its refund is handled.
+    const payment = db.prepare("SELECT paymentStatus FROM orders WHERE id = ?").get(id);
+    if (String(payment?.paymentStatus || "").toUpperCase() === "PAID") {
+      return res.status(409).json({ error: "Paid cancellation requires verified refund processing" });
     }
 
     const result = db.prepare(`
