@@ -46,6 +46,39 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    if (event.type === "refund.updated" || event.type === "refund.created" || event.type === "charge.refunded") {
+      // Only settle our own tracked refund; never infer completion from a charge event.
+      if (event.type === "charge.refunded") return res.json({ received: true });
+      const incoming = event.data.object;
+      const tracked = db.prepare(
+        "SELECT * FROM stripe_cancellation_refunds WHERE stripeRefundId = ?"
+      ).get(incoming.id);
+      if (!tracked) return res.json({ received: true });
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(tracked.orderId);
+      if (!order || order.status !== "CANCELLED" ||
+          Number(tracked.amountCents) !== Number(incoming.amount) ||
+          String(tracked.stripePaymentIntentId || "") !== String(incoming.payment_intent || "")) {
+        console.error("Stripe refund webhook mismatch; manual review required", incoming.id);
+        return res.status(409).json({ error: "Refund/order mismatch" });
+      }
+      const newStatus = String(incoming.status || "").toLowerCase();
+      db.transaction(() => {
+        db.prepare(`
+          UPDATE stripe_cancellation_refunds
+          SET refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?
+        `).run(newStatus, tracked.orderId);
+        if (newStatus === "succeeded") {
+          db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUNDED'
+            WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
+          `).run(tracked.orderId);
+        }
+      })();
+      if (newStatus === "succeeded") {
+        logOrderEvent(tracked.orderId, "STRIPE_REFUND_CONFIRMED", "Stripe confirmed refund succeeded", "system", null);
+      }
+      return res.json({ received: true });
+    }
     if (event.type === "checkout.session.completed" && event.data.object?.metadata?.quoteOrderId) {
       const session = event.data.object;
       if (session.payment_status !== "paid") return res.json({ received: true });
