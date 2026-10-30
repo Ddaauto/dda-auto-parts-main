@@ -893,6 +893,13 @@ CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS shippo_additional_refunds (
+  orderId TEXT PRIMARY KEY,
+  amountCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS shippo_label_refund_verifications (
   shippoTransactionId TEXT PRIMARY KEY,
   orderId TEXT NOT NULL,
@@ -2577,6 +2584,41 @@ app.post("/admin/orders/:id/shippo-refund-verification", authRequired, (req, res
   } catch (error) {
     console.error("Shippo refund verification failed:", error);
     return res.status(500).json({ error: "Unable to verify Shippo refund" });
+  }
+});
+// Additional Shippo refund ledger: reserve exact verified funds for one customer payout.
+// This endpoint never moves money and never returns the retained $5 processing fee.
+app.post("/admin/orders/:id/shippo-additional-refund/prepare", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "Explicit preparation confirmation required" });
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || !settlement ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED") {
+        return { error: "Initial customer refund must be confirmed first", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents),0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const existing = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (existing) return { error: "Additional refund already prepared; reconcile existing record", code: 409 };
+      if (!Number.isSafeInteger(verified) || verified <= 0 || verified > settlement.labelCostCents ||
+          settlement.initialRefundCents + verified > settlement.amountPaidCents - 500) {
+        return { error: "Verified Shippo amount exceeds refundable balance", code: 409 };
+      }
+      db.prepare(`INSERT INTO shippo_additional_refunds (orderId, amountCents, status, createdBy)
+        VALUES (?, ?, 'PREPARED', ?)`).run(id, verified, String(req.user?.id || ""));
+      return { ok: true, orderId: id, amountCents: verified, status: "PREPARED",
+        retainedProcessingFeeCents: 500, fundsSent: false };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_REFUND_PREPARED", "Verified Shippo funds reserved for customer refund; not sent", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Additional Shippo refund preparation error:", error);
+    return res.status(500).json({ error: "Unable to prepare additional refund" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
