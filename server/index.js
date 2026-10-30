@@ -813,6 +813,10 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS inventory_cancellation_restorations (
+  orderId TEXT PRIMARY KEY,
+  restoredAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sku TEXT NOT NULL UNIQUE,
@@ -893,6 +897,34 @@ function reserveInventoryOrThrow(db, items) {
   for (const [sku, qty] of quantities) {
     decStock.run(qty, sku);
   }
+}
+// Restore reserved stock at most once; called inside the same transaction as cancellation.
+function restoreInventoryForCancelledOrder(db, orderId) {
+  const order = db.prepare("SELECT status, inventoryDeductedAt, itemsJson FROM orders WHERE id = ?").get(orderId);
+  if (!order || String(order.status || "").toUpperCase() !== "CANCELLED") {
+    throw new Error("Order must be cancelled before restoring inventory");
+  }
+  if (!order.inventoryDeductedAt) return false;
+  const claimed = db.prepare(
+    "INSERT OR IGNORE INTO inventory_cancellation_restorations (orderId) VALUES (?)"
+  ).run(orderId);
+  if (!claimed.changes) return false;
+  const items = JSON.parse(order.itemsJson || "[]");
+  if (!Array.isArray(items) || !items.length) throw new Error("Invalid cancelled order items");
+  const quantities = new Map();
+  for (const item of items) {
+    const sku = String(item.sku || "").trim();
+    const qty = Number(item.qty);
+    if (!sku || !Number.isSafeInteger(qty) || qty <= 0) throw new Error("Invalid cancelled order item");
+    const total = (quantities.get(sku) || 0) + qty;
+    if (!Number.isSafeInteger(total)) throw new Error("Invalid cancelled order quantity");
+    quantities.set(sku, total);
+  }
+  for (const [sku, qty] of quantities) {
+    const updated = db.prepare("UPDATE products SET stock = stock + ? WHERE sku = ?").run(qty, sku);
+    if (updated.changes !== 1) throw new Error("Cannot restore missing SKU: " + sku);
+  }
+  return true;
 }
 function deductInventoryOnceForPaidOrder(db, orderId) {
   return db.transaction(() => {
@@ -2687,6 +2719,7 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
             END
         WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')
       `).run(orderId, customerId);
+      if (result.changes) restoreInventoryForCancelledOrder(db, orderId);
       return { result, status: "CANCELLED" };
     })();
     if (decision.error || !decision.result?.changes) {
