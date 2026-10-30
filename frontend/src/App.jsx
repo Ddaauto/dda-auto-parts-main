@@ -6,6 +6,7 @@ import logo from "./assets/logo.jpg";
 import Success from "./Success";
 import Cancel from "./NewCancel";
 import QuoteReview from "./QuoteReview";
+import CustomerPackageTracking from "./CustomerPackageTracking";
 /**
  * =========================
  * CONFIG
@@ -950,6 +951,7 @@ setTimeout(() => {
   </div>
 </div>
                   </div>
+                  <CustomerPackageTracking api={API} orderId={o.id} />
                 </div>
               ))}
             </div>
