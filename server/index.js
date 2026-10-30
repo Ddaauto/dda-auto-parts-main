@@ -1830,6 +1830,8 @@ app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
     if (["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(order.status || "").toUpperCase())) {
       return res.status(409).json({ error: "This order requires shipping-aware cancellation review" });
     }
+    const labelPurchase = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id);
+    if (labelPurchase) return res.status(409).json({ error: "Shipping label exists or purchase is in progress; manual shipping review required" });
     const paid = String(order.paymentStatus || "").toUpperCase() === "PAID";
     const result = db.prepare(`
       UPDATE orders
@@ -1874,6 +1876,8 @@ app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
     if (String(row.status || "").toUpperCase() !== "CANCEL_REQUESTED") {
       return res.status(400).json({ error: "Order is not waiting for cancel approval" });
     }
+    const labelPurchase = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id);
+    if (labelPurchase) return res.status(409).json({ error: "Shipping label exists or purchase is in progress; shipping review required" });
     // Stop fulfillment immediately; refunds are handled after cancellation.
     const result = db.prepare(`
   UPDATE orders
@@ -2000,6 +2004,13 @@ app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
 
     if (String(row.paymentStatus || "").toUpperCase() === "REFUNDED") {
       return res.status(400).json({ error: "Already refunded" });
+    }
+    const refundOrder = db.prepare("SELECT status, paymentMethod FROM orders WHERE id = ?").get(id);
+    if (String(refundOrder?.status || "").toUpperCase() !== "CANCELLED" || String(row.paymentStatus || "").toUpperCase() !== "REFUND_PENDING") {
+      return res.status(409).json({ error: "Order must be cancelled with refund pending" });
+    }
+    if (String(refundOrder.paymentMethod || "").toLowerCase() !== "zelle") {
+      return res.status(409).json({ error: "Card refunds must be verified through Stripe; this action is for manual Zelle confirmation only" });
     }
 
     const result = db.prepare(`
