@@ -2150,6 +2150,55 @@ app.post("/admin/orders/:id/label-cancellation-review", authRequired, (req, res)
     return res.status(500).json({ error: "Could not record cancellation review" });
   }
 });
+// Approve/reject the review record only. No order cancellation or money movement.
+app.put("/admin/orders/:id/label-cancellation-review/decision", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const decision = String(req.body?.decision || "").toUpperCase();
+    if (!["APPROVED", "REJECTED"].includes(decision)) {
+      return res.status(400).json({ error: "decision must be APPROVED or REJECTED" });
+    }
+    if (req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm carrier has not picked up the parcel" });
+    }
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      if (!order) return { error: "Order not found", code: 404 };
+      if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+        return { error: "Order status requires shipping review", code: 409 };
+      }
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (!review || review.reviewStatus !== "PENDING" || review.carrierNotPickedUpConfirmed !== 1) {
+        return { error: "No eligible pending review", code: 409 };
+      }
+      const currentLabels = db.prepare(
+        "SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id"
+      ).all(id);
+      if (JSON.stringify(currentLabels) !== review.labelSnapshotJson) {
+        return { error: "Shipping labels changed; manual review required", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE label_cancellation_reviews
+        SET reviewStatus = ?, adminId = ?, updatedAt = datetime('now')
+        WHERE orderId = ? AND reviewStatus = 'PENDING'`
+      ).run(decision, String(req.user?.id || ""), id);
+      if (!changed.changes) return { error: "Review already decided", code: 409 };
+      return { ok: true, orderId: id, reviewStatus: decision,
+        labelCostCents: review.labelCostCents,
+        processingFeeCents: review.processingFeeCents,
+        potentialCancellationFeeCents: review.totalFeeCents,
+        orderCancelled: false, refundInitiated: false };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_REVIEW_" + decision,
+      "Admin decided label cancellation review; order and payment unchanged",
+      "admin", String(req.user?.id || ""));
+    return res.json(outcome);
+  } catch (error) {
+    console.error("Label cancellation decision error:", error);
+    return res.status(500).json({ error: "Failed to decide label cancellation review" });
+  }
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
