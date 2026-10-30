@@ -9,7 +9,7 @@ export default function AdminShippingLabelDetails({ api, orderId }) {
     if (refreshing) return;
     setRefreshing(labelId); setError("");
     try {
-      const response = await fetch(`${api}/api/tracking/admin/orders/${encodeURIComponent(orderId)}/refresh-tracking`, {
+      const response = await fetch(`${api}/shipping/admin/orders/${encodeURIComponent(orderId)}/refresh-tracking`, {
         method: "POST",
         headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}`, "Content-Type": "application/json" },
         body: JSON.stringify({ labelId })
