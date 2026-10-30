@@ -13,10 +13,38 @@ export default function createCustomerTrackingRouter(db, authRequired) {
   }
   router.use(authRequired);
   const activeLabels = orderId => db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
-    purchasedAt, carrierTrackingStatus, carrierTrackingCheckedAt
+    purchasedAt, carrierTrackingStatus, carrierTrackingCheckedAt, packageItemsJson
     FROM shipping_labels WHERE orderId = ? AND shippoTransactionId NOT LIKE 'pending-%'
     AND COALESCE(refundStatus,'') NOT IN ('PENDING','SUCCESS','REFUNDED','PURCHASING','PURCHASE_REVIEW')
     ORDER BY purchasedAt ASC, id ASC`).all(orderId);
+  // Never mark an order fully shipped while some ordered units have no label.
+  // Legacy labels without allocations remain unverified rather than guessed.
+  const fullyAllocated = (orderId, labels) => {
+    const row = db.prepare("SELECT itemsJson FROM orders WHERE id = ?").get(orderId);
+    let items;
+    try { items = JSON.parse(row?.itemsJson || "[]"); } catch { return false; }
+    if (!Array.isArray(items) || !items.length || !labels.length) return false;
+    const required = new Map();
+    for (const item of items) {
+      const key = String(item.id || item.sku || "");
+      const qty = Number(item.qty || item.quantity || 1);
+      if (!key || !Number.isSafeInteger(qty) || qty < 1) return false;
+      required.set(key, (required.get(key) || 0) + qty);
+    }
+    const allocated = new Map();
+    for (const label of labels) {
+      let parts;
+      try { parts = JSON.parse(label.packageItemsJson || "[]"); } catch { return false; }
+      if (!Array.isArray(parts) || !parts.length) return false;
+      for (const part of parts) {
+        const key = String(part.key || "");
+        const qty = Number(part.qty);
+        if (!required.has(key) || !Number.isSafeInteger(qty) || qty < 1) return false;
+        allocated.set(key, (allocated.get(key) || 0) + qty);
+      }
+    }
+    return [...required].every(([key, qty]) => allocated.get(key) === qty);
+  };
   const accepted = status => ["TRANSIT","DELIVERED","OUT_FOR_DELIVERY","FAILURE","RETURNED"].includes(status);
   const delivery = status => status === "DELIVERED";
   router.get("/orders/:id/tracking", (req, res) => {
@@ -33,15 +61,16 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     }));
     const pickedUp = labels.filter(label => accepted(label.carrierTrackingStatus || "")).length;
     const delivered = labels.filter(label => delivery(label.carrierTrackingStatus || "")).length;
+    const complete = fullyAllocated(order.id, labels);
     const shippingStatus = !labels.length ? "NOT_LABELED"
-      : delivered === labels.length ? "DELIVERED"
-      : pickedUp === labels.length ? "SHIPPED"
+      : complete && delivered === labels.length ? "DELIVERED"
+      : complete && pickedUp === labels.length ? "SHIPPED"
       : pickedUp > 0 ? "PARTIALLY_SHIPPED" : "LABEL_CREATED";
     return res.json({
       orderId: order.id, orderNumber: order.orderNumber,
       shippingStatus, carrierAcceptanceConfirmed: pickedUp > 0,
       allPackagesAccepted: labels.length > 0 && pickedUp === labels.length,
-      packageCount: labels.length, pickedUpCount: pickedUp, deliveredCount: delivered,
+      allItemsLabeled: complete, packageCount: labels.length, pickedUpCount: pickedUp, deliveredCount: delivered,
       deliveredAt: order.deliveredAt || null,
       tracking: tracking[0] || null, packages: tracking
     });
@@ -74,10 +103,10 @@ export default function createCustomerTrackingRouter(db, authRequired) {
         const deliveredAll = all.length > 0 && all.every(item => item.carrierTrackingStatus === "DELIVERED");
         const pickedUpAll = all.length > 0 && all.every(item =>
           ["TRANSIT","OUT_FOR_DELIVERY","DELIVERED","RETURNED","FAILURE"].includes(item.carrierTrackingStatus));
-        if (deliveredAll) {
+        if (deliveredAll && fullyAllocated(order.id, all)) {
           db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
           if (deliveryDate) db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate,order.id);
-        } else if (pickedUpAll) {
+        } else if (pickedUpAll && fullyAllocated(order.id, all)) {
           db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
         }
       })();
