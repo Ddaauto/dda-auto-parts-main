@@ -42,13 +42,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     const labels = db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
       labelUrl, amount, currency, lengthIn, widthIn, heightIn, weightOz,
       purchasedAt, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
-    res.json({ labels: labels.map(label => ({
-      ...label,
-      purchaseState: label.refundStatus === "PURCHASING" ? "PURCHASE_IN_PROGRESS"
-        : label.refundStatus === "PURCHASE_REVIEW" ? "PURCHASE_REVIEW"
-        : label.shippoTransactionId?.startsWith("pending-") ? "PURCHASE_REVIEW"
-        : "LABEL_CREATED"
-    })) });
+    res.json({ labels });
   });
   const orderSnapshot = id => {
     const row = db.prepare(`SELECT id, orderNumber, invoiceId, createdAt, customerSnapshot, itemsJson, status FROM orders WHERE id = ?`).get(id);
