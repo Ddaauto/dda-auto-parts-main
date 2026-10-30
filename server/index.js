@@ -655,6 +655,25 @@ function logOrderEvent(orderId, type, message, actorType = "system", actorId = n
     console.error("logOrderEvent error:", err);
   }
 }
+async function notifyCustomerCancellationStatus(order) {
+  const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
+  if (!customer?.email) return false;
+  const payment = String(order.paymentStatus || "").toUpperCase();
+  const detail = payment === "REFUNDED"
+    ? "Your refund has been confirmed by the payment processor."
+    : payment === "REFUND_PENDING"
+      ? "Your refund is being processed. We will notify you when confirmed."
+      : payment === "PAYMENT_VERIFICATION_PENDING"
+        ? "We are verifying whether payment was received. Any confirmed payment will be reviewed for a full refund."
+        : "No refund is required unless a payment is subsequently confirmed.";
+  const number = String(order.orderNumber || order.id);
+  await sendEmail({
+    to: customer.email,
+    subject: `Order cancelled - ${number} | DDA Auto Parts`,
+    text: `Your order ${number} has been cancelled. ${detail}`
+  });
+  return true;
+}
 // ===== NOTIFY ADMIN (cancel request) =====
 async function notifyAdminCancelRequested(order) {
   console.log("NOTIFY ADMIN CANCEL REQUEST:", order);
@@ -1989,6 +2008,11 @@ logOrderEvent(
         String(cancelled?.paymentMethod || "").toLowerCase() !== "zelle") {
       refund = await submitCancelledStripeRefund(cancelled, "admin", req.user?.id ? String(req.user.id) : null);
       if (!refund.ok) console.warn("Admin cancellation requires Stripe refund review:", id);
+    }
+    try {
+      await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(id));
+    } catch (emailError) {
+      console.error("Admin cancellation customer email failed:", emailError);
     }
     return res.json({ ok: true, changes: result.changes, refund });
   } catch (e) {
