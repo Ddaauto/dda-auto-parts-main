@@ -957,6 +957,9 @@ CREATE TABLE IF NOT EXISTS products (
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `);
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN transferReference TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedBy TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedAt TEXT"); } catch {}
 // ===== PRODUCT COST COLUMN =====
 try {
   db.exec(`ALTER TABLE products ADD COLUMN cost_cents INTEGER NOT NULL DEFAULT 0;`);
@@ -2619,6 +2622,46 @@ app.post("/admin/orders/:id/shippo-additional-refund/prepare", authRequired, (re
   } catch (error) {
     console.error("Additional Shippo refund preparation error:", error);
     return res.status(500).json({ error: "Unable to prepare additional refund" });
+  }
+});
+// Confirm an additional Zelle refund already transferred to the customer.
+app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm Zelle transfer was sent" });
+    const id = String(req.params.id || "");
+    const evidence = String(req.body?.transferReference || "").trim();
+    if (!evidence || evidence.length > 500) return res.status(400).json({ error: "Transfer reference required" });
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const extra = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (!order || !settlement || !extra || order.status !== "CANCELLED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED" || String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle" || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          extra.status !== "PREPARED") {
+        return { error: "No eligible prepared Zelle additional refund", code: 409 };
+      }
+      if (!Number.isSafeInteger(extra.amountCents) || extra.amountCents <= 0 ||
+          Number(req.body?.amountCents) !== extra.amountCents ||
+          settlement.initialRefundCents + extra.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Transfer amount does not match verified refundable balance", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE shippo_additional_refunds
+        SET status = 'CONFIRMED', transferReference = ?, confirmedBy = ?,
+            confirmedAt = datetime('now') WHERE orderId = ? AND status = 'PREPARED'`
+      ).run(evidence, String(req.user?.id || ""), id);
+      if (!changed.changes) return { error: "Already confirmed", code: 409 };
+      return { ok: true, orderId: id, amountCents: extra.amountCents,
+        status: "CONFIRMED", processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_ZELLE_REFUND_CONFIRMED",
+      "Admin confirmed additional Zelle transfer with reference", "admin", String(req.user?.id || ""));
+    return res.json(result);
+  } catch (error) {
+    console.error("Additional Zelle refund confirmation error:", error);
+    return res.status(500).json({ error: "Unable to confirm additional Zelle refund" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
