@@ -69,7 +69,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (!exists) return res.status(404).json({ error: "Order not found" });
     const labels = db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
       labelUrl, amount, currency, lengthIn, widthIn, heightIn, weightOz,
-      purchasedAt, refundStatus, packageItemsJson FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
+      purchasedAt, refundStatus, packageItemsJson, carrierTrackingStatus, carrierTrackingCheckedAt FROM shipping_labels WHERE orderId = ? ORDER BY purchasedAt DESC`).all(req.params.id);
     res.json({ labels });
   });
   const orderSnapshot = id => {
