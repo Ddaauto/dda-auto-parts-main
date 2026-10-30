@@ -2499,18 +2499,41 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       return res.status(400).json({ error: "Cancellation request period has expired (30 days)." });
     }
 
-    const result = db.prepare(`
-      UPDATE orders
-      SET status = 'CANCEL_REQUESTED'
-      WHERE id = ? AND customerId = ?
-    `).run(orderId, customerId);
-logOrderEvent(
-  orderId,
-  "CANCEL_REQUESTED",
-  "Customer requested cancellation",
-  "customer",
-  req.user?.id ? String(req.user.id) : null
-);
+    // Decide under a single database transaction so label purchase reservations
+    // and cancellation cannot both be initiated in this database.
+    const decision = db.transaction(() => {
+      const current = db.prepare(
+        "SELECT status, paymentStatus FROM orders WHERE id = ? AND customerId = ?"
+      ).get(orderId, customerId);
+      if (!current || !["PENDING", "PAID"].includes(String(current.status || "").toUpperCase())) {
+        return { error: "Order is no longer eligible for cancellation" };
+      }
+      const label = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(orderId);
+      if (label) {
+        const result = db.prepare(
+          "UPDATE orders SET status = 'CANCEL_REQUESTED' WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')"
+        ).run(orderId, customerId);
+        return { result, status: "CANCEL_REQUESTED" };
+      }
+      const result = db.prepare(`
+        UPDATE orders
+        SET status = 'CANCELLED',
+            paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' ELSE 'CANCELLED' END
+        WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')
+      `).run(orderId, customerId);
+      return { result, status: "CANCELLED" };
+    })();
+    if (decision.error || !decision.result?.changes) {
+      return res.status(409).json({ error: decision.error || "Order state changed; retry cancellation" });
+    }
+    const result = decision.result;
+    logOrderEvent(
+      orderId,
+      decision.status === "CANCELLED" ? "ORDER_CANCELLED" : "CANCEL_REQUESTED",
+      decision.status === "CANCELLED" ? "Customer cancelled before label purchase; refund to follow if paid" : "Customer requested cancellation",
+      "customer",
+      req.user?.id ? String(req.user.id) : null
+    );
     const order = db.prepare(`
       SELECT o.*, c.email AS customerEmail
       FROM orders o
@@ -2527,7 +2550,7 @@ logOrderEvent(
     console.log("REQUEST CANCEL ORDER ID:", orderId);
     console.log("REQUEST CANCEL CHANGES:", result.changes);
 
-    return res.json({ ok: true, changes: result.changes });
+    return res.json({ ok: true, changes: result.changes, status: decision.status, refundPending: decision.status === "CANCELLED" && String(order.paymentStatus || "").toUpperCase() === "REFUND_PENDING" });
   } catch (e) {
     console.error("❌ /orders/:id/request-cancel error:", e);
     return res.status(500).json({ error: "Failed to request cancellation" });
