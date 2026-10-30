@@ -2074,6 +2074,7 @@ app.get("/admin/orders", authRequired, (req, res) => {
     o.status,
     o.paymentStatus,
     o.paymentMethod,
+    EXISTS(SELECT 1 FROM shipping_labels sl WHERE sl.orderId = o.id) AS shippingLabelCreated,
     o.createdAt
   FROM orders o
   LEFT JOIN customers c ON c.id = o.customerId
