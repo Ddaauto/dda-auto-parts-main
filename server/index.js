@@ -902,6 +902,12 @@ function deductInventoryOnceForPaidOrder(db, orderId) {
 
     if (!order) throw new Error("Order not found");
 
+    // Never allocate stock to an order cancelled while payment confirmation
+    // or another asynchronous fulfillment step was still in flight.
+    if (["CANCELLED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+      throw new Error("Cannot deduct inventory for a cancelled order");
+    }
+
     if (order.inventoryDeductedAt) {
       return false;
     }
