@@ -55,6 +55,18 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         if (!order || order.stripeSessionId !== session.id) {
           throw new Error("Quote payment session does not match its order");
         }
+        if (String(order.status || "").toUpperCase() === "CANCELLED") {
+          if (Math.round(Number(order.grandTotal) * 100) !== session.amount_total ||
+              String(session.currency).toLowerCase() !== "usd") {
+            throw new Error("Cancelled quote checkout total mismatch");
+          }
+          db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUND_PENDING'
+            WHERE id = ? AND status = 'CANCELLED'
+              AND paymentStatus IN ('PENDING', 'CANCELLED', 'PAYMENT_VERIFICATION_PENDING')
+          `).run(order.id);
+          return { orderId: order.id, cancelledPayment: true };
+        }
         if (order.paymentStatus === "PAID") {
           if (!order.inventoryDeductedAt) deductInventoryOnceForPaidOrder(db, order.id);
           return { orderId: order.id, alreadyPaid: true };
@@ -70,6 +82,11 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         deductInventoryOnceForPaidOrder(db, order.id);
         return { orderId: order.id, alreadyPaid: false };
       })();
+      if (saved.cancelledPayment) {
+        logOrderEvent(saved.orderId, "CANCELLED_PAYMENT_CONFIRMED", "Stripe payment arrived after quote cancellation; refund required", "system", null);
+        console.warn("Stripe payment received for cancelled quote order; refund pending:", saved.orderId);
+        return res.json({ received: true });
+      }
       if (!saved.alreadyPaid) {
         const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(saved.orderId);
         try {
