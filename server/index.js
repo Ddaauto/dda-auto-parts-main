@@ -994,6 +994,9 @@ CREATE TABLE IF NOT EXISTS products (
 try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN transferReference TEXT"); } catch {}
 try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedBy TEXT"); } catch {}
 try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedAt TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN transferReference TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN confirmedBy TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN confirmedAt TEXT"); } catch {}
 // ===== PRODUCT COST COLUMN =====
 try {
   db.exec(`ALTER TABLE products ADD COLUMN cost_cents INTEGER NOT NULL DEFAULT 0;`);
@@ -2793,6 +2796,53 @@ app.post("/admin/orders/:id/shippo-additional-refund/prepare-next-batch", authRe
   } catch (error) {
     console.error("Shippo next batch preparation failed:", error);
     return res.status(500).json({ error: "Unable to prepare later Shippo refund batch" });
+  }
+});
+// Confirm a later Shippo-funded Zelle batch only after the transfer has been sent.
+app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-zelle", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm transfer was actually sent" });
+    const id = String(req.params.id || "");
+    const batchId = Number(req.params.batchId);
+    const reference = String(req.body?.transferReference || "").trim();
+    if (!Number.isSafeInteger(batchId) || batchId <= 0 || !reference || reference.length > 500) {
+      return res.status(400).json({ error: "Valid batch and transfer reference required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT amountCents, status FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      const batch = db.prepare("SELECT * FROM shippo_additional_refund_batches WHERE id = ? AND orderId = ?").get(batchId, id);
+      if (!order || !settlement || !first || !batch || order.status !== "CANCELLED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle" || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          first.status !== "CONFIRMED" || batch.status !== "PREPARED") {
+        return { error: "Batch not eligible for Zelle confirmation", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const otherBatches = db.prepare("SELECT COALESCE(SUM(amountCents), 0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ? AND id != ?").get(id, batchId).cents;
+      if (!Number.isSafeInteger(batch.amountCents) || batch.amountCents <= 0 ||
+          Number(req.body?.amountCents) !== batch.amountCents ||
+          first.amountCents + otherBatches + batch.amountCents > verified ||
+          settlement.initialRefundCents + first.amountCents + otherBatches + batch.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Transfer amount exceeds verified refundable funds", code: 409 };
+      }
+      const updated = db.prepare(`UPDATE shippo_additional_refund_batches
+        SET status = 'CONFIRMED', transferReference = ?, confirmedBy = ?,
+            confirmedAt = datetime('now') WHERE id = ? AND orderId = ? AND status = 'PREPARED'`
+      ).run(reference, String(req.user?.id || "admin"), batchId, id);
+      if (!updated.changes) return { error: "Batch already processed", code: 409 };
+      return { ok: true, orderId: id, batchId, amountCents: batch.amountCents,
+        status: "CONFIRMED", processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ZELLE_BATCH_CONFIRMED", "Admin confirmed later Zelle transfer", "admin", String(req.user?.id || ""));
+    return res.json(result);
+  } catch (error) {
+    console.error("Shippo Zelle batch confirmation failed:", error);
+    return res.status(500).json({ error: "Unable to confirm Zelle batch" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
