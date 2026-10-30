@@ -716,13 +716,16 @@ async function cancelOrder(id) {
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not cancel order");
@@ -734,13 +737,16 @@ async function approveCancelOrder(id) {
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/approve-cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/approve-cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not approve cancellation");
@@ -752,13 +758,16 @@ async function rejectCancelOrder(id) {
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/reject-cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/reject-cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not reject cancellation");
