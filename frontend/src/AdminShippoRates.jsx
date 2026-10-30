@@ -6,12 +6,18 @@ export default function AdminShippoRates({ api, orderId = null }) {
     toStreet: "", toCity: "", toState: "", toZip: "",
   });
   const [origin, setOrigin] = useState(null);
+  const [multiPackage, setMultiPackage] = useState(false);
+  const [packageQty, setPackageQty] = useState({});
+  const [existingLabels, setExistingLabels] = useState([]);
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [ordersError, setOrdersError] = useState("");
   useEffect(() => {
     setSelectedOrder(null);
     setRates(null);
     setOrdersError("");
+    setExistingLabels([]);
+    setPackageQty({});
+    setMultiPackage(false);
     if (!orderId) return;
     let active = true;
     fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}`, {
@@ -23,6 +29,14 @@ export default function AdminShippoRates({ api, orderId = null }) {
     }).then(order => {
       if (!active) return;
       setSelectedOrder(order);
+      fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}/labels`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("token") || ""}` }
+      }).then(res => res.json()).then(data => {
+        if (!active) return;
+        const labels = Array.isArray(data.labels) ? data.labels : [];
+        setExistingLabels(labels);
+        if (labels.length) setMultiPackage(true);
+      }).catch(() => {});
       setForm(old => ({ ...old, toStreet: order.customer.street1 || "", toCity: order.customer.city || "", toState: order.customer.state || "", toZip: order.customer.zip || "" }));
     }).catch(err => { if (active) setOrdersError(err.message); });
     return () => { active = false; };
@@ -43,21 +57,25 @@ export default function AdminShippoRates({ api, orderId = null }) {
   const [busy, setBusy] = useState(false);
   const [purchasing, setPurchasing] = useState(false);
   const [purchaseResult, setPurchaseResult] = useState(null);
+  const selectedPackageItems = (selectedOrder?.items || []).map(item => ({
+    key: String(item.id || item.sku), qty: Number(packageQty[String(item.id || item.sku)] || 0)
+  })).filter(item => item.qty > 0);
   const purchaseLabel = async rate => {
     if (!orderId || !selectedOrder || purchasing) return;
     if (rate.test) { setError("Test rates cannot be purchased here."); return; }
-    const confirmed = window.confirm(`Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and moves the order to Shipped.`);
+    const confirmed = window.confirm(`Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and creates a label (carrier pickup is tracked separately).`);
     if (!confirmed) return;
     setPurchasing(true); setError("");
     try {
       const res = await fetch(`${api}/admin/shippo/orders/${encodeURIComponent(orderId)}/purchase-label`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token") || ""}` },
-        body: JSON.stringify({ rateId: rate.id, expectedAmount: rate.amount, expectedCurrency: rate.currency, confirm: true }),
+        body: JSON.stringify({ rateId: rate.id, expectedAmount: rate.amount, expectedCurrency: rate.currency, confirm: true, multiPackage }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Purchase could not be confirmed");
       setPurchaseResult(data);
+      setExistingLabels(old => [...old, { trackingNumber: data.trackingNumber, labelUrl: data.labelUrl, packageItemsJson: JSON.stringify(selectedPackageItems) }]);
       setRates(null);
     } catch (err) { setError(err.message); }
     finally { setPurchasing(false); }
@@ -77,7 +95,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
             heightIn: Number(form.heightIn), weightOz: Number(form.weightOz),
           },
           destination: { street1: form.toStreet, city: form.toCity, state: form.toState, zip: form.toZip },
-          ...(orderId ? { orderId } : {}),
+          ...(orderId ? { orderId, multiPackage, packageItems: selectedPackageItems } : {}),
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -103,8 +121,28 @@ export default function AdminShippoRates({ api, orderId = null }) {
       {selectedOrder && <div style={{ marginTop: 16 }}>
         <p><strong>Order:</strong> {selectedOrder.orderNumber || selectedOrder.invoiceId} · <strong>Customer:</strong> {selectedOrder.customer.name || selectedOrder.customer.email}</p>
         <p><strong>Ship to:</strong> {[selectedOrder.customer.street1, selectedOrder.customer.city, selectedOrder.customer.state, selectedOrder.customer.zip].filter(Boolean).join(", ") || "Missing shipping address"}</p>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0" }}>
+          <input type="checkbox" checked={multiPackage} disabled={existingLabels.length > 0}
+            onChange={e => { setMultiPackage(e.target.checked); setRates(null); }} />
+          <strong>Multi-package item — more than one shipping label</strong>
+        </label>
+        {multiPackage && <p>Select the quantity of each item packed in THIS box. Repeat for each additional box and label.</p>}
+        {existingLabels.length > 0 && <p><strong>Labels created:</strong> {existingLabels.length}. Additional packages require multi-package mode.</p>}
         <h4>Products in shipment</h4>
-        {selectedOrder.items.length ? selectedOrder.items.map((item, index) => <div key={item.id || index} style={{ display: "flex", justifyContent: "space-between", padding: "12px 4px", borderBottom: "1px solid #e2e8f0" }}><span><strong>{item.name}</strong>{item.sku && <small style={{ display: "block", color: "#64748b" }}>SKU: {item.sku}</small>}</span><strong>Qty: {item.qty}</strong></div>) : <p>No product details available.</p>}
+        {selectedOrder.items.length ? selectedOrder.items.map((item, index) => {
+          const key = String(item.id || item.sku);
+          const used = existingLabels.reduce((sum, label) => {
+            try { return sum + (JSON.parse(label.packageItemsJson || "[]").find(p => p.key === key)?.qty || 0); }
+            catch { return sum; }
+          }, 0);
+          const remaining = Math.max(0, Number(item.qty) - used);
+          return <div key={key || index} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "12px 4px", borderBottom: "1px solid #e2e8f0" }}>
+            <span><strong>{item.name}</strong>{item.sku && <small style={{ display: "block", color: "#64748b" }}>SKU: {item.sku}</small>}</span>
+            {multiPackage ? <label>Qty in this package: <input type="number" min="0" max={remaining} step="1"
+              value={packageQty[key] ?? 0} onChange={e => { setPackageQty(old => ({ ...old, [key]: e.target.value })); setRates(null); }}
+              style={{ width: 64 }} /> <small>of {remaining} remaining</small></label> : <strong>Qty: {item.qty}</strong>}
+          </div>;
+        }) : <p>No product details available.</p>}
       </div>}
     </section>
     <form onSubmit={submit} style={{ display: "grid", gap: 12 }}>
@@ -126,12 +164,12 @@ export default function AdminShippoRates({ api, orderId = null }) {
         {field("toState", "State")}
         {field("toZip", "ZIP")}
       </div>
-      <button className="btn btnPrimary" type="submit" disabled={busy || !origin || (Boolean(orderId) && !selectedOrder)}>
+      <button className="btn btnPrimary" type="submit" disabled={busy || !origin || (Boolean(orderId) && !selectedOrder) || (Boolean(orderId) && multiPackage && !selectedPackageItems.length)}>
         {busy ? "Checking rates..." : "Get Shippo rates"}
       </button>
     </form>
     {error && <p role="alert" style={{ color: "#dc2626" }}>{error}</p>}
-    {purchaseResult && <div role="status" style={{ padding: 16, background: "#ecfdf5", borderRadius: 10, marginTop: 16 }}><strong>Shipping label purchased. Order moved to Shipped.</strong><p>Tracking: {purchaseResult.trackingNumber || "Not provided"}</p>{purchaseResult.labelUrl && <a href={purchaseResult.labelUrl} target="_blank" rel="noopener noreferrer">Open / Print label PDF</a>}</div>}
+    {purchaseResult && <div role="status" style={{ padding: 16, background: "#ecfdf5", borderRadius: 10, marginTop: 16 }}><strong>Shipping label created. Carrier pickup is not yet confirmed.</strong><p>Tracking: {purchaseResult.trackingNumber || "Not provided"}</p>{purchaseResult.labelUrl && <a href={purchaseResult.labelUrl} target="_blank" rel="noopener noreferrer">Open / Print label PDF</a>}</div>}
     {rates && <div style={{ marginTop: 16 }}>
       <h3>Available rates {rates.rates?.length ? `(${rates.rates.length})` : ""}</h3>
       {!rates.rates?.length && <p>No rates returned for this package and address.</p>}
