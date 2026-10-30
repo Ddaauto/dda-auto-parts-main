@@ -930,7 +930,7 @@ const getOrderCategory = o => {
   const payment = String(o.paymentStatus || "").toUpperCase();
   if (["CANCELLED", "CANCELED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
   if (["SHIPPED", "DELIVERED"].includes(status)) return "shipped";
-  if (["PAID", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
+  if (["PAID", "LABEL_CREATED", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
   return "pending";
 };
 const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((counts, category) => {
@@ -1407,11 +1407,11 @@ alert("CSV imported successfully");
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
             <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
-            {getOrderCategory(o) === "shipped" && <button className="btn" onClick={() => setExpandedShippingLabels(old => ({ ...old, [o.id]: !old[o.id] }))}>{expandedShippingLabels[o.id] ? "Hide label details" : "Shipping Label Details"}</button>}
+            {["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(o.status || "").toUpperCase()) && <button className="btn" onClick={() => setExpandedShippingLabels(old => ({ ...old, [o.id]: !old[o.id] }))}>{expandedShippingLabels[o.id] ? "Hide label details" : "Shipping Label Details"}</button>}
             <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
             <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
           </div>
-          {getOrderCategory(o) === "shipped" && expandedShippingLabels[o.id] && <div style={{ marginTop: 16, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
+          {["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(o.status || "").toUpperCase()) && expandedShippingLabels[o.id] && <div style={{ marginTop: 16, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
             <AdminShippingLabelDetails api={API_BASE} orderId={o.id} />
           </div>}
           {detailsOpen && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
