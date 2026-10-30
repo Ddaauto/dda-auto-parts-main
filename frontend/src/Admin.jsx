@@ -930,10 +930,11 @@ const getOrderCategory = o => {
   const payment = String(o.paymentStatus || "").toUpperCase();
   if (["CANCELLED", "CANCELED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
   if (["SHIPPED", "DELIVERED"].includes(status)) return "shipped";
-  if (["PAID", "LABEL_CREATED", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
+  if (status === "LABEL_CREATED") return "label_created";
+  if (["PAID", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
   return "pending";
 };
-const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((counts, category) => {
+const orderCounts = ["pending", "unshipped", "label_created", "canceled", "shipped"].reduce((counts, category) => {
   counts[category] = (orders || []).filter(o => getOrderCategory(o) === category).length;
   return counts;
 }, {});
@@ -1356,7 +1357,7 @@ alert("CSV imported successfully");
 </div>
 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16, paddingBottom: 12, borderBottom: "1px solid #e2e8f0" }}>
   {[
-    ["pending", "Pending"], ["unshipped", "Unshipped"],
+    ["pending", "Pending"], ["unshipped", "Unshipped"], ["label_created", "Label Created"],
     ["canceled", "Canceled"], ["shipped", "Shipped"]
   ].map(([id, label]) => <button key={id} type="button" onClick={() => setOrderCategory(id)}
     className="btn" style={{ background: orderCategory === id ? "#1e3a5f" : "#f1f5f9", color: orderCategory === id ? "#fff" : "#334155", fontWeight: orderCategory === id ? 800 : 500 }}>
