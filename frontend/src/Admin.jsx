@@ -710,6 +710,20 @@ async function loadQuotes() {
   }
 }
 
+async function previewLabelCancellation(id) {
+  try {
+    const token = localStorage.getItem("token");
+    const response = await fetch(`${API}/admin/orders/${id}/label-cancellation-preview`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Preview failed (HTTP ${response.status})`);
+    window.alert("Label cancellation preview (read-only):\n" + JSON.stringify(data, null, 2) +
+      "\n\nThis preview does NOT cancel the order or issue a refund.");
+  } catch (error) {
+    window.alert(error.message || "Could not preview label cancellation");
+  }
+}
 async function cancelOrder(id) {
   if (!window.confirm("Cancel this order?")) return;
 
@@ -1436,6 +1450,7 @@ alert("CSV imported successfully");
             </div>
             {items.length > 2 && <div style={{ marginTop: 14 }}>{items.slice(2).map((item, i) => <div key={i} style={{ padding: "5px 0" }}>{item.name || item.sku || "Product"} · Qty {item.qty || item.quantity || 1}</div>)}</div>}
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
+              {status === "LABEL_CREATED" && <button className="btn" type="button" onClick={() => previewLabelCancellation(o.id)}>Review cancellation fees (no changes)</button>}
               {status === "CANCEL_REQUESTED" ? <>
                 <button className="btn" onClick={() => approveCancelOrder(o.id)}>Approve cancellation</button>
                 <button className="btn" onClick={() => rejectCancelOrder(o.id)}>Reject cancellation</button>
