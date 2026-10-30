@@ -50,6 +50,27 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       // Only settle our own tracked refund; never infer completion from a charge event.
       if (event.type === "charge.refunded") return res.json({ received: true });
       const incoming = event.data.object;
+      const partial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (partial) {
+        const valid = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(partial.orderId);
+        if (!valid || valid.status !== "CANCELLED" ||
+            Number(incoming.amount) !== partial.amountCents ||
+            String(incoming.payment_intent || "") !== partial.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Partial refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        const confirmed = db.transaction(() => {
+          const current = db.prepare("SELECT refundStatus FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(partial.orderId);
+          if (current?.refundStatus === "succeeded") return false;
+          db.prepare("UPDATE stripe_partial_cancellation_refunds SET refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?").run(state, partial.orderId);
+          if (state !== "succeeded") return false;
+          db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ? AND status = 'CANCELLED_REFUND_PENDING'").run(partial.orderId);
+          return !!db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(partial.orderId).changes;
+        })();
+        if (confirmed) logOrderEvent(partial.orderId, "STRIPE_PARTIAL_REFUND_CONFIRMED", "Stripe confirmed initial partial refund", "system", null, { amountCents: partial.amountCents });
+        return res.json({ received: true });
+      }
       const tracked = db.prepare(
         "SELECT * FROM stripe_cancellation_refunds WHERE stripeRefundId = ?"
       ).get(incoming.id);
@@ -863,6 +884,15 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
+  orderId TEXT PRIMARY KEY,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING',
+  createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+  updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS label_cancellation_settlements (
   orderId TEXT PRIMARY KEY,
   paymentMethod TEXT NOT NULL,
@@ -2385,6 +2415,68 @@ app.post("/admin/orders/:id/label-cancellation-settlement/confirm-zelle-refund",
   } catch (error) {
     console.error("Confirm partial Zelle refund error:", error);
     return res.status(500).json({ error: "Unable to confirm partial Zelle refund" });
+  }
+});
+// Stripe partial refund: claim once before the external call; uncertain outcomes require reconciliation.
+app.post("/admin/orders/:id/label-cancellation-settlement/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit refund confirmation required" });
+    const id = String(req.params.id || "");
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const plan = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !plan || order.status !== "CANCELLED" || order.paymentStatus !== "REFUND_PENDING" ||
+          plan.status !== "CANCELLED_REFUND_PENDING" || !["stripe", "card"].includes(plan.paymentMethod)) {
+        return { error: "No eligible Stripe partial refund", code: 409 };
+      }
+      const amount = plan.initialRefundCents;
+      const paymentIntentId = String(order.stripePaymentIntentId || "");
+      if (!/^pi_[a-zA-Z0-9]+$/.test(paymentIntentId) ||
+          !Number.isSafeInteger(amount) || amount <= 0 ||
+          amount > plan.amountPaidCents || amount !== plan.amountPaidCents - plan.labelCostCents - 500) {
+        return { error: "Invalid payment intent or partial refund amount", code: 409 };
+      }
+      if (db.prepare("SELECT orderId FROM stripe_cancellation_refunds WHERE orderId = ?").get(id)) {
+        return { error: "Full refund workflow already exists; manual review required", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO stripe_partial_cancellation_refunds
+        (orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?)`).run(id, paymentIntentId, amount);
+      if (!inserted.changes) return { error: "Refund already requested or under review", code: 409 };
+      return { orderId: id, paymentIntentId, amountCents: amount };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, kind: "label_cancellation_initial_partial" }
+      }, { idempotencyKey: `dda-label-partial-${id}` });
+      db.prepare(`UPDATE stripe_partial_cancellation_refunds
+        SET stripeRefundId = ?, refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?`
+      ).run(refund.id, String(refund.status || "pending").toLowerCase(), id);
+      // Reconcile immediately in case Stripe's webhook arrived before persistence.
+      const verified = await stripe.refunds.retrieve(refund.id);
+      if (verified.id === refund.id && verified.status === "succeeded" &&
+          Number(verified.amount) === claim.amountCents &&
+          String(verified.payment_intent || "") === claim.paymentIntentId) {
+        db.transaction(() => {
+          db.prepare("UPDATE stripe_partial_cancellation_refunds SET refundStatus = 'succeeded', updatedAt = datetime('now') WHERE orderId = ?").run(id);
+          db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ? AND status = 'CANCELLED_REFUND_PENDING'").run(id);
+          db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(id);
+        })();
+      }
+      return res.json({ ok: true, refundId: refund.id, amountCents: claim.amountCents,
+        status: verified.status, requiresConfirmation: verified.status !== "succeeded" });
+    } catch (error) {
+      db.prepare(`UPDATE stripe_partial_cancellation_refunds SET refundStatus = 'REVIEW_REQUIRED',
+        updatedAt = datetime('now') WHERE orderId = ? AND refundStatus != 'succeeded'`).run(id);
+      console.error("Stripe partial refund requires reconciliation:", id, error);
+      return res.status(202).json({ ok: false, reviewRequired: true,
+        message: "Stripe result uncertain; reconcile before any retry" });
+    }
+  } catch (error) {
+    console.error("Partial refund endpoint error:", error);
+    return res.status(500).json({ error: "Unable to process partial refund" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
