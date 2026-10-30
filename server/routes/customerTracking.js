@@ -69,7 +69,7 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     return res.json({
       orderId: order.id, orderNumber: order.orderNumber,
       shippingStatus, carrierAcceptanceConfirmed: pickedUp > 0,
-      allPackagesAccepted: labels.length > 0 && pickedUp === labels.length,
+      allPackagesAccepted: complete && labels.length > 0 && pickedUp === labels.length,
       allItemsLabeled: complete, packageCount: labels.length, pickedUpCount: pickedUp, deliveredCount: delivered,
       deliveredAt: order.deliveredAt || null,
       tracking: tracking[0] || null, packages: tracking
@@ -105,7 +105,7 @@ export default function createCustomerTrackingRouter(db, authRequired) {
           ["TRANSIT","OUT_FOR_DELIVERY","DELIVERED","RETURNED","FAILURE"].includes(item.carrierTrackingStatus));
         if (deliveredAll && fullyAllocated(order.id, all)) {
           db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
-          if (deliveryDate) db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate,order.id);
+          db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate || now,order.id);
         } else if (pickedUpAll && fullyAllocated(order.id, all)) {
           db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
         }
