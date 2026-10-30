@@ -2479,6 +2479,49 @@ app.post("/admin/orders/:id/label-cancellation-settlement/refund-stripe", authRe
     return res.status(500).json({ error: "Unable to process partial refund" });
   }
 });
+// Read-only Shippo refund reconciliation: a label refund is not customer money yet.
+app.get("/admin/orders/:id/shippo-refund-reconciliation", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id || "");
+    const order = db.prepare("SELECT id, status, paymentStatus FROM orders WHERE id = ?").get(id);
+    const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+    if (!order || !settlement || order.status !== "CANCELLED") {
+      return res.status(409).json({ error: "Cancelled label settlement required" });
+    }
+    const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+    if (!labels.length) return res.status(409).json({ error: "No labels found" });
+    let confirmedCents = 0;
+    const details = [];
+    for (const label of labels) {
+      const amount = String(label.amount ?? "").trim();
+      if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
+          String(label.currency || "").toUpperCase() !== "USD") {
+        return res.status(409).json({ error: "Invalid label amount; manual review required" });
+      }
+      const cents = Math.round(Number(amount) * 100);
+      if (!Number.isSafeInteger(cents)) return res.status(409).json({ error: "Invalid label amount" });
+      const state = String(label.refundStatus || "").toUpperCase();
+      // Local status alone is NOT proof Shippo has returned the money.
+      details.push({ labelId: label.id, transactionId: label.shippoTransactionId,
+        labelCostCents: cents, shippoRefundStatus: state || "UNKNOWN",
+        verificationRequired: true });
+    }
+    return res.json({
+      orderId: id, settlementStatus: settlement.status,
+      processingFeeRetainedCents: 500,
+      labelCostCents: settlement.labelCostCents,
+      shippoRefundsVerifiedCents: confirmedCents,
+      additionalCustomerRefundAuthorizedCents: 0,
+      labels: details,
+      requiresShippoFinancialVerification: true,
+      notice: "Verify Shippo refund settlement independently before authorizing any additional customer refund. No funds moved."
+    });
+  } catch (error) {
+    console.error("Shippo refund reconciliation error:", error);
+    return res.status(500).json({ error: "Could not reconcile Shippo label refunds" });
+  }
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
