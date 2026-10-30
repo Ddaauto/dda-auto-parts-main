@@ -3071,6 +3071,12 @@ return res.json({ ok: true, changes: result.changes, status: newStatus, updated 
 });
 async function submitCancelledStripeRefund(order, actorType = "system", actorId = null) {
   const id = order.id;
+  // Label cancellations have their own partial-refund workflow.
+  // Never initiate a full Stripe refund for an order with a label settlement.
+  if (db.prepare("SELECT orderId FROM label_cancellation_settlements WHERE orderId = ?").get(id)) {
+    return { ok: false, partialSettlementRequired: true,
+      error: "Label cancellation requires its dedicated partial refund workflow" };
+  }
   const claim = db.prepare(`
     INSERT OR IGNORE INTO stripe_cancellation_refunds (orderId, refundStatus)
     VALUES (?, 'REQUESTING')
@@ -3163,6 +3169,9 @@ app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
 
     if (String(row.paymentStatus || "").toUpperCase() === "REFUNDED") {
       return res.status(400).json({ error: "Already refunded" });
+    }
+    if (db.prepare("SELECT orderId FROM label_cancellation_settlements WHERE orderId = ?").get(id)) {
+      return res.status(409).json({ error: "Label cancellation requires its dedicated partial Zelle refund confirmation" });
     }
     const refundOrder = db.prepare("SELECT status, paymentMethod FROM orders WHERE id = ?").get(id);
     if (String(refundOrder?.status || "").toUpperCase() !== "CANCELLED" || String(row.paymentStatus || "").toUpperCase() !== "REFUND_PENDING") {
