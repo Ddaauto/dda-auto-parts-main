@@ -863,6 +863,17 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS label_cancellation_settlements (
+  orderId TEXT PRIMARY KEY,
+  paymentMethod TEXT NOT NULL,
+  amountPaidCents INTEGER NOT NULL,
+  labelCostCents INTEGER NOT NULL,
+  processingFeeCents INTEGER NOT NULL,
+  initialRefundCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS label_cancellation_reviews (
   orderId TEXT PRIMARY KEY,
   reviewStatus TEXT NOT NULL DEFAULT 'PENDING',
@@ -2244,6 +2255,53 @@ app.get("/admin/orders/:id/label-cancellation-settlement", authRequired, (req, r
   } catch (error) {
     console.error("Label cancellation settlement preview error:", error);
     return res.status(500).json({ error: "Unable to calculate settlement" });
+  }
+});
+// Persist a unique settlement plan. No order mutation or payment transfer.
+app.post("/admin/orders/:id/label-cancellation-settlement/prepare", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "confirmPrepare must be true" });
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT id, status, paymentStatus, paymentMethod, grandTotal FROM orders WHERE id = ?").get(id);
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (!order || !review || review.reviewStatus !== "APPROVED" ||
+          !["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase()) ||
+          String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+        return { error: "Order/payment/review not eligible", code: 409 };
+      }
+      const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+      if (!labels.length || JSON.stringify(labels) !== review.labelSnapshotJson) {
+        return { error: "Shipping label data changed", code: 409 };
+      }
+      const paid = Math.round(Number(order.grandTotal) * 100);
+      const fee = Number(review.totalFeeCents);
+      if (!Number.isSafeInteger(paid) || !Number.isSafeInteger(fee) || paid < fee ||
+          fee !== Number(review.labelCostCents) + 500) {
+        return { error: "Invalid settlement amounts", code: 409 };
+      }
+      const method = String(order.paymentMethod || "").toLowerCase();
+      if (method !== "zelle" && method !== "stripe" && method !== "card") {
+        return { error: "Payment method needs manual review", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO label_cancellation_settlements
+        (orderId, paymentMethod, amountPaidCents, labelCostCents, processingFeeCents, initialRefundCents, createdBy)
+        VALUES (?, ?, ?, ?, 500, ?, ?)`
+      ).run(id, method, paid, review.labelCostCents, paid - fee, String(req.user?.id || ""));
+      if (!inserted.changes) return { error: "Settlement already prepared; review existing record", code: 409 };
+      return { ok: true, orderId: id, status: "PREPARED", paymentMethod: method,
+        initialRefundCents: paid - fee, labelCostCents: review.labelCostCents,
+        processingFeeCents: 500, orderCancelled: false, refundSubmitted: false };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_SETTLEMENT_PREPARED",
+      "Admin prepared label cancellation settlement; no payment or cancellation executed",
+      "admin", String(req.user?.id || ""));
+    return res.status(201).json(outcome);
+  } catch (error) {
+    console.error("Prepare label settlement error:", error);
+    return res.status(500).json({ error: "Could not prepare settlement" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
