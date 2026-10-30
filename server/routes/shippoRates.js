@@ -215,7 +215,7 @@ export default function createShippoRatesRouter(db, authRequired) {
           trackingUrl = ?, purchasedAt = ?, refundStatus = '' WHERE id = ?`)
           .run(result.object_id, result.label_url, result.tracking_number || "",
             result.tracking_url_provider || "", new Date().toISOString(), reservationId);
-        const changed = db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'PAID'").run(orderId);
+        const changed = db.prepare("UPDATE orders SET status = 'LABEL_CREATED' WHERE id = ? AND status = 'PAID'").run(orderId);
         if (changed.changes !== 1) throw new Error("Order changed while purchasing label");
         db.prepare("DELETE FROM shippo_rate_quotes WHERE orderId = ?").run(orderId);
       })();
