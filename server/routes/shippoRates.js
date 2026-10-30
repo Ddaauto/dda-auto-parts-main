@@ -40,6 +40,7 @@ export default function createShippoRatesRouter(db, authRequired) {
     "ALTER TABLE shipping_labels ADD COLUMN packageItemsJson TEXT DEFAULT '[]'",
     "ALTER TABLE shippo_rate_quotes ADD COLUMN packageItemsJson TEXT DEFAULT '[]'"
   ]) { try { db.exec(ddl); } catch (e) { if (!String(e.message).includes("duplicate column name")) throw e; } }
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_shippo_one_inflight_purchase_per_order ON shipping_labels(orderId) WHERE refundStatus IN ('PURCHASING','PURCHASE_REVIEW')");
   const purchasedLabels = id => db.prepare("SELECT * FROM shipping_labels WHERE orderId = ? AND COALESCE(refundStatus,'') NOT IN ('SUCCESS','REFUNDED')").all(id);
   const packageAllocation = (order, input, multi) => {
     const totals = new Map(order.items.map(item => [String(item.id || item.sku), Number(item.qty)]));
