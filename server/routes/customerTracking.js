@@ -59,7 +59,12 @@ export default function createCustomerTrackingRouter(db, authRequired) {
       const deliveryDate=status==="DELIVERED" && rawDate && Number.isFinite(Date.parse(rawDate)) ? new Date(rawDate).toISOString() : null;
       db.transaction(()=>{
         db.prepare("UPDATE shipping_labels SET carrierTrackingStatus = ?, carrierTrackingCheckedAt = ? WHERE id = ?").run(status,now,label.id);
-        if(deliveryDate)db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate,order.id);
+        if (status === "DELIVERED") {
+          db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
+          if (deliveryDate) db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate,order.id);
+        } else if (["TRANSIT", "OUT_FOR_DELIVERY", "RETURNED"].includes(status)) {
+          db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
+        }
       })();
       return res.json({ok:true,carrierStatus:status,deliveredAt:deliveryDate || order.deliveredAt || null});
     } catch(error) {
