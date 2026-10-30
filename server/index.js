@@ -2556,7 +2556,8 @@ app.post("/admin/orders/:id/label-cancellation-settlement/confirm-zelle-refund",
     logOrderEvent(id, "ZELLE_PARTIAL_REFUND_CONFIRMED",
       "Admin confirmed partial Zelle refund sent", "admin", String(req.user?.id || ""),
       { amountCents: outcome.amountCents });
-    await notifyCustomerPartialRefundOnce(id, `initial-zelle:${id}`, outcome.amountCents, "Zelle");
+    try { await notifyCustomerPartialRefundOnce(id, `initial-zelle:${id}`, outcome.amountCents, "Zelle"); }
+    catch (error) { console.error("Initial Zelle partial refund email requires review:", error); }
     return res.json(outcome);
   } catch (error) {
     console.error("Confirm partial Zelle refund error:", error);
@@ -2610,6 +2611,8 @@ app.post("/admin/orders/:id/label-cancellation-settlement/refund-stripe", authRe
           db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ? AND status = 'CANCELLED_REFUND_PENDING'").run(id);
           db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(id);
         })();
+        try { await notifyCustomerPartialRefundOnce(id, `initial-stripe:${id}`, claim.amountCents, "Stripe"); }
+        catch (error) { console.error("Immediate Stripe partial refund email requires review:", error); }
       }
       return res.json({ ok: true, refundId: refund.id, amountCents: claim.amountCents,
         status: verified.status, requiresConfirmation: verified.status !== "succeeded" });
