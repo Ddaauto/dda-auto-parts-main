@@ -12,30 +12,38 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     }
   }
   router.use(authRequired);
-  const activeLabel = orderId => db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
+  const activeLabels = orderId => db.prepare(`SELECT id, carrier, service, trackingNumber, trackingUrl,
     purchasedAt, carrierTrackingStatus, carrierTrackingCheckedAt
     FROM shipping_labels WHERE orderId = ? AND shippoTransactionId NOT LIKE 'pending-%'
-    AND COALESCE(refundStatus,'') NOT IN ('PENDING','SUCCESS','REFUNDED')
-    ORDER BY purchasedAt DESC LIMIT 1`).get(orderId);
+    AND COALESCE(refundStatus,'') NOT IN ('PENDING','SUCCESS','REFUNDED','PURCHASING','PURCHASE_REVIEW')
+    ORDER BY purchasedAt ASC, id ASC`).all(orderId);
+  const accepted = status => ["TRANSIT","DELIVERED","OUT_FOR_DELIVERY","FAILURE","RETURNED"].includes(status);
+  const delivery = status => status === "DELIVERED";
   router.get("/orders/:id/tracking", (req, res) => {
     const customerId = req.user?.customerId;
     if (!customerId) return res.status(403).json({ error: "Customer account required" });
     const order = db.prepare("SELECT id, orderNumber, deliveredAt FROM orders WHERE id = ? AND customerId = ?")
       .get(req.params.id, customerId);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    const label = activeLabel(order.id);
-    const carrierStatus = label?.carrierTrackingStatus || "";
-    const accepted = ["TRANSIT","DELIVERED","OUT_FOR_DELIVERY","FAILURE","RETURNED"].includes(carrierStatus);
+    const labels = activeLabels(order.id);
+    const tracking = labels.map(label => ({
+      labelId: label.id, carrier: label.carrier, service: label.service,
+      number: label.trackingNumber, url: label.trackingUrl, labelCreatedAt: label.purchasedAt,
+      carrierStatus: label.carrierTrackingStatus || "", checkedAt: label.carrierTrackingCheckedAt || null
+    }));
+    const pickedUp = labels.filter(label => accepted(label.carrierTrackingStatus || "")).length;
+    const delivered = labels.filter(label => delivery(label.carrierTrackingStatus || "")).length;
+    const shippingStatus = !labels.length ? "NOT_LABELED"
+      : delivered === labels.length ? "DELIVERED"
+      : pickedUp === labels.length ? "SHIPPED"
+      : pickedUp > 0 ? "PARTIALLY_SHIPPED" : "LABEL_CREATED";
     return res.json({
       orderId: order.id, orderNumber: order.orderNumber,
-      shippingStatus: order.deliveredAt ? "DELIVERED" : accepted ? "SHIPPED" : label ? "LABEL_CREATED" : "NOT_LABELED",
-      carrierAcceptanceConfirmed: accepted,
+      shippingStatus, carrierAcceptanceConfirmed: pickedUp > 0,
+      allPackagesAccepted: labels.length > 0 && pickedUp === labels.length,
+      packageCount: labels.length, pickedUpCount: pickedUp, deliveredCount: delivered,
       deliveredAt: order.deliveredAt || null,
-      tracking: label ? {
-        carrier: label.carrier, service: label.service, number: label.trackingNumber,
-        url: label.trackingUrl, labelCreatedAt: label.purchasedAt,
-        carrierStatus, checkedAt: label.carrierTrackingCheckedAt || null
-      } : null
+      tracking: tracking[0] || null, packages: tracking
     });
   });
   // Explicit admin-only refresh. No label purchases, refunds or customer emails.
@@ -43,7 +51,9 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     if (req.user?.role !== "admin") return res.status(403).json({error:"Admin only"});
     const order=db.prepare("SELECT id, deliveredAt FROM orders WHERE id = ?").get(req.params.id);
     if(!order)return res.status(404).json({error:"Order not found"});
-    const label=activeLabel(order.id);
+    const labels=activeLabels(order.id);
+    if (labels.length !== 1) return res.status(409).json({error:"Multiple packages require per-label tracking refresh; no status changed"});
+    const label=labels[0];
     if(!label?.carrier || !label?.trackingNumber)return res.status(409).json({error:"No active label with carrier and tracking number"});
     const token=process.env.SHIPPO_API_TOKEN;
     if(!token)return res.status(503).json({error:"Shippo is not configured"});
