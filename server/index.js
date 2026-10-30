@@ -2805,6 +2805,14 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       }
     }
 
+    if (decision.status === "CANCELLED") {
+      try {
+        await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId));
+      } catch (emailError) {
+        console.error("Customer cancellation email failed:", emailError);
+      }
+    }
+
     console.log("REQUEST CANCEL ORDER ID:", orderId);
     console.log("REQUEST CANCEL CHANGES:", result.changes);
 
