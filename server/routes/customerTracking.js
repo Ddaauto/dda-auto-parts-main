@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { shipmentProgress } from "../services/shipmentProgress.js";
 
 // Shippo tracking states are independent of the purchase of a shipping label.
 export default function createCustomerTrackingRouter(db, authRequired) {
@@ -17,33 +18,11 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     FROM shipping_labels WHERE orderId = ? AND shippoTransactionId NOT LIKE 'pending-%'
     AND COALESCE(refundStatus,'') NOT IN ('PENDING','SUCCESS','REFUNDED','PURCHASING','PURCHASE_REVIEW')
     ORDER BY purchasedAt ASC, id ASC`).all(orderId);
-  // Never mark an order fully shipped while some ordered units have no label.
-  // Legacy labels without allocations remain unverified rather than guessed.
-  const fullyAllocated = (orderId, labels) => {
+  const progress = (orderId, labels) => {
     const row = db.prepare("SELECT itemsJson FROM orders WHERE id = ?").get(orderId);
     let items;
-    try { items = JSON.parse(row?.itemsJson || "[]"); } catch { return false; }
-    if (!Array.isArray(items) || !items.length || !labels.length) return false;
-    const required = new Map();
-    for (const item of items) {
-      const key = String(item.id || item.sku || "");
-      const qty = Number(item.qty || item.quantity || 1);
-      if (!key || !Number.isSafeInteger(qty) || qty < 1) return false;
-      required.set(key, (required.get(key) || 0) + qty);
-    }
-    const allocated = new Map();
-    for (const label of labels) {
-      let parts;
-      try { parts = JSON.parse(label.packageItemsJson || "[]"); } catch { return false; }
-      if (!Array.isArray(parts) || !parts.length) return false;
-      for (const part of parts) {
-        const key = String(part.key || "");
-        const qty = Number(part.qty);
-        if (!required.has(key) || !Number.isSafeInteger(qty) || qty < 1) return false;
-        allocated.set(key, (allocated.get(key) || 0) + qty);
-      }
-    }
-    return [...required].every(([key, qty]) => allocated.get(key) === qty);
+    try { items = JSON.parse(row?.itemsJson || "[]"); } catch { items = []; }
+    return shipmentProgress(items, labels);
   };
   const accepted = status => ["TRANSIT","DELIVERED","OUT_FOR_DELIVERY","FAILURE","RETURNED"].includes(status);
   const delivery = status => status === "DELIVERED";
@@ -61,7 +40,7 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     }));
     const pickedUp = labels.filter(label => accepted(label.carrierTrackingStatus || "")).length;
     const delivered = labels.filter(label => delivery(label.carrierTrackingStatus || "")).length;
-    const complete = fullyAllocated(order.id, labels);
+    const complete = progress(order.id, labels).complete;
     const shippingStatus = !labels.length ? "NOT_LABELED"
       : complete && delivered === labels.length ? "DELIVERED"
       : complete && pickedUp === labels.length ? "SHIPPED"
@@ -103,10 +82,10 @@ export default function createCustomerTrackingRouter(db, authRequired) {
         const deliveredAll = all.length > 0 && all.every(item => item.carrierTrackingStatus === "DELIVERED");
         const pickedUpAll = all.length > 0 && all.every(item =>
           ["TRANSIT","OUT_FOR_DELIVERY","DELIVERED","RETURNED","FAILURE"].includes(item.carrierTrackingStatus));
-        if (deliveredAll && fullyAllocated(order.id, all)) {
+        if (deliveredAll && progress(order.id, all).complete) {
           db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
           db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate || now,order.id);
-        } else if (pickedUpAll && fullyAllocated(order.id, all)) {
+        } else if (pickedUpAll && progress(order.id, all).complete) {
           db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
         }
       })();
