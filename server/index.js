@@ -2055,6 +2055,39 @@ logOrderEvent(
     return res.status(500).json({ error: "Failed to cancel order" });
   }
 });
+// Read-only preview. Never approve cancellation or charge a fee based on this alone.
+app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const order = db.prepare("SELECT id, status, grandTotal FROM orders WHERE id = ?").get(String(req.params.id || ""));
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  const labels = db.prepare(
+    "SELECT id, amount, currency, refundStatus, shippoTransactionId FROM shipping_labels WHERE orderId = ?"
+  ).all(order.id);
+  if (!labels.length) return res.status(409).json({ error: "No purchased label found; use the no-label cancellation workflow" });
+  // Never calculate a customer fee when a label's purchase amount or currency is uncertain.
+  const cents = labels.map(label => {
+    const amount = String(label.amount ?? "").trim();
+    if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
+        String(label.currency || "").toUpperCase() !== "USD" ||
+        !label.shippoTransactionId) return null;
+    const value = Math.round(Number(amount) * 100);
+    return Number.isSafeInteger(value) ? value : null;
+  });
+  if (cents.some(value => value === null)) {
+    return res.status(409).json({ error: "Label cost not verified; manual shipping review required" });
+  }
+  const labelCostCents = cents.reduce((sum, value) => sum + value, 0);
+  const processingFeeCents = 500;
+  return res.json({
+    orderId: order.id, orderStatus: order.status,
+    labelCount: labels.length, labelCostCents, processingFeeCents,
+    potentialCancellationFeeCents: labelCostCents + processingFeeCents,
+    labelRefundStatuses: labels.map(label => label.refundStatus || "UNKNOWN"),
+    requiresAdminApproval: true,
+    shippingConfirmationRequired: true,
+    notice: "Estimate only. Verify carrier pickup and Shippo label refund before approving or charging."
+  });
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
