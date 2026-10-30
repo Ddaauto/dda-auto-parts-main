@@ -18,6 +18,24 @@ jobs:
       - name: Install backend dependencies
         run: npm install --no-audit --no-fund
       - name: Check backend syntax
-        run: npm run check:syntax
+        run: |
+          npm run check:syntax
+          node --check routes/shippoRates.js
+          node --check routes/customerTracking.js
       - name: Run backend unit tests
         run: npm test
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+      - name: Build customer and admin frontend
+        run: npm run build
