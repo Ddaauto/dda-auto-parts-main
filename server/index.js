@@ -2199,6 +2199,53 @@ app.put("/admin/orders/:id/label-cancellation-review/decision", authRequired, (r
     return res.status(500).json({ error: "Failed to decide label cancellation review" });
   }
 });
+// Financial preview for an approved review; does not change the order or issue refunds.
+app.get("/admin/orders/:id/label-cancellation-settlement", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id || "");
+    const order = db.prepare("SELECT id, status, paymentStatus, grandTotal, paymentMethod FROM orders WHERE id = ?").get(id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+    if (!review || review.reviewStatus !== "APPROVED") {
+      return res.status(409).json({ error: "Approved label cancellation review required" });
+    }
+    if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+      return res.status(409).json({ error: "Order requires shipping status review" });
+    }
+    const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+    if (JSON.stringify(labels) !== review.labelSnapshotJson) {
+      return res.status(409).json({ error: "Label information changed; review again before settlement" });
+    }
+    if (String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+      return res.status(409).json({ error: "Payment must be verified before calculating a refund" });
+    }
+    const total = Number(order.grandTotal);
+    const amountCents = Math.round(total * 100);
+    if (!Number.isFinite(total) || !Number.isSafeInteger(amountCents) || amountCents < 0 ||
+        !Number.isSafeInteger(review.totalFeeCents) || review.totalFeeCents < 500) {
+      return res.status(409).json({ error: "Invalid payment or cancellation amount" });
+    }
+    if (amountCents < review.totalFeeCents) {
+      return res.status(409).json({ error: "Cancellation fees exceed amount paid; manual review required" });
+    }
+    return res.json({
+      orderId: id, paymentMethod: order.paymentMethod,
+      amountPaidCents: amountCents,
+      labelCostCents: review.labelCostCents,
+      processingFeeCents: 500,
+      initialRefundCents: amountCents - review.totalFeeCents,
+      additionalRefundIfShippoRefundsAllLabelsCents: review.labelCostCents,
+      totalRefundIfShippoRefundsAllLabelsCents: amountCents - 500,
+      requiresManualSettlement: true,
+      refundSubmitted: false,
+      orderCancelled: false
+    });
+  } catch (error) {
+    console.error("Label cancellation settlement preview error:", error);
+    return res.status(500).json({ error: "Unable to calculate settlement" });
+  }
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
