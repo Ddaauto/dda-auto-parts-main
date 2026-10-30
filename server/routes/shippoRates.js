@@ -43,8 +43,17 @@ export default function createShippoRatesRouter(db, authRequired) {
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_shippo_one_inflight_purchase_per_order ON shipping_labels(orderId) WHERE refundStatus IN ('PURCHASING','PURCHASE_REVIEW')");
   const purchasedLabels = id => db.prepare("SELECT * FROM shipping_labels WHERE orderId = ? AND COALESCE(refundStatus,'') NOT IN ('SUCCESS','REFUNDED')").all(id);
   const packageAllocation = (order, input, multi) => {
-    const totals = new Map(order.items.map(item => [String(item.id || item.sku), Number(item.qty)]));
-    if (!multi) return { items: order.items.map(item => ({ key: String(item.id || item.sku), qty: Number(item.qty) })) };
+    const totals = new Map();
+    for (const item of order.items) {
+      const key = String(item.id || item.sku || "");
+      const qty = Number(item.qty);
+      if (!key || !Number.isSafeInteger(qty) || qty < 1) return { error: "Order contains invalid item quantities" };
+      totals.set(key, (totals.get(key) || 0) + qty);
+    }
+    if (!multi) {
+      if (purchasedLabels(order.id).length) return { error: "Order already has a label; use multi-package mode to allocate remaining items" };
+      return { items: [...totals].map(([key, qty]) => ({ key, qty })) };
+    }
     if (!Array.isArray(input) || !input.length) return { error: "Choose quantities for this package" };
     const selected = new Map();
     for (const item of input) {
