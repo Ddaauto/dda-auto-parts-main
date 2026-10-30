@@ -2295,6 +2295,8 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
 app.post("/admin/orders/:id/label-cancellation-review", authRequired, (req, res) => {
   try {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
     const id = String(req.params.id || "");
     if (req.body?.carrierNotPickedUpConfirmed !== true) {
       return res.status(400).json({ error: "Explicit confirmation that carrier has not picked up the parcel is required" });
@@ -2348,6 +2350,8 @@ app.put("/admin/orders/:id/label-cancellation-review/decision", authRequired, (r
     if (req.body?.carrierNotPickedUpConfirmed !== true) {
       return res.status(400).json({ error: "Confirm carrier has not picked up the parcel" });
     }
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
     const id = String(req.params.id || "");
     const outcome = db.transaction(() => {
       const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
@@ -2438,6 +2442,8 @@ app.post("/admin/orders/:id/label-cancellation-settlement/prepare", authRequired
   try {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
     if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "confirmPrepare must be true" });
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
     const id = String(req.params.id || "");
     const outcome = db.transaction(() => {
       const order = db.prepare("SELECT id, status, paymentStatus, paymentMethod, grandTotal FROM orders WHERE id = ?").get(id);
@@ -2488,6 +2494,8 @@ app.post("/admin/orders/:id/label-cancellation-settlement/cancel-order", authReq
     if (req.body?.confirmCancellation !== true || req.body?.carrierNotPickedUpConfirmed !== true) {
       return res.status(400).json({ error: "Explicit cancellation and no-pickup confirmations required" });
     }
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
     const id = String(req.params.id || "");
     const result = db.transaction(() => {
       const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
