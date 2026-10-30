@@ -750,6 +750,34 @@ async function notifyCustomerCancellationStatus(order) {
 }
 // One delivery attempt per refund. An uncertain email outcome is left for
 // manual review rather than risking duplicate customer notifications.
+// A separate notification key for each confirmed partial refund.
+// Unknown delivery results are not retried automatically.
+async function notifyCustomerPartialRefundOnce(orderId, notificationKey, amountCents, source) {
+  if (!Number.isSafeInteger(amountCents) || amountCents <= 0 ||
+      !["Zelle", "Stripe"].includes(source)) return false;
+  const order = db.prepare(`SELECT o.id, o.orderNumber, o.status, o.paymentStatus, c.email AS customerEmail
+    FROM orders o LEFT JOIN customers c ON c.id = o.customerId WHERE o.id = ?`).get(orderId);
+  if (!order || order.status !== "CANCELLED" ||
+      order.paymentStatus !== "PARTIALLY_REFUNDED" || !order.customerEmail) return false;
+  const key = String(notificationKey || "");
+  if (!key || key.length > 180) return false;
+  const claimed = db.prepare(`INSERT OR IGNORE INTO partial_refund_notification_attempts
+    (notificationKey, orderId) VALUES (?, ?)`).run(key, orderId);
+  if (!claimed.changes) return false;
+  try {
+    await sendEmail({
+      to: order.customerEmail,
+      subject: `Partial refund confirmed - ${order.orderNumber || order.id} | DDA Auto Parts`,
+      text: `A partial refund of ${(amountCents / 100).toFixed(2)} for cancelled order ${order.orderNumber || order.id} has been ${source === "Zelle" ? "recorded as sent through Zelle" : "confirmed by Stripe"}. The $5.00 cancellation processing fee is non-refundable. Any additional Shippo label refund will be handled separately.`
+    });
+    db.prepare("UPDATE partial_refund_notification_attempts SET status = 'SENT' WHERE notificationKey = ?").run(key);
+    return true;
+  } catch (error) {
+    db.prepare("UPDATE partial_refund_notification_attempts SET status = 'REVIEW_REQUIRED' WHERE notificationKey = ?").run(key);
+    console.error("Partial refund email requires review:", key, error);
+    return false;
+  }
+}
 async function notifyCustomerRefundConfirmedOnce(orderId) {
   const order = db.prepare(`
     SELECT o.*, c.email AS customerEmail FROM orders o
@@ -1007,6 +1035,12 @@ CREATE TABLE IF NOT EXISTS label_cancellation_reviews (
   adminId TEXT,
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS partial_refund_notification_attempts (
+  notificationKey TEXT PRIMARY KEY,
+  orderId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'SENDING',
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS refund_confirmation_emails (
   orderId TEXT PRIMARY KEY,
@@ -2509,6 +2543,7 @@ app.post("/admin/orders/:id/label-cancellation-settlement/confirm-zelle-refund",
     logOrderEvent(id, "ZELLE_PARTIAL_REFUND_CONFIRMED",
       "Admin confirmed partial Zelle refund sent", "admin", String(req.user?.id || ""),
       { amountCents: outcome.amountCents });
+    await notifyCustomerPartialRefundOnce(id, `initial-zelle:${id}`, outcome.amountCents, "Zelle");
     return res.json(outcome);
   } catch (error) {
     console.error("Confirm partial Zelle refund error:", error);
