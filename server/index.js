@@ -2060,6 +2060,7 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
   if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
   const order = db.prepare("SELECT id, status, grandTotal FROM orders WHERE id = ?").get(String(req.params.id || ""));
   if (!order) return res.status(404).json({ error: "Order not found" });
+  if (["SHIPPED", "DELIVERED", "CANCELLED"].includes(String(order.status || "").toUpperCase())) return res.status(409).json({ error: "Shipped, delivered, or cancelled orders cannot enter this review" });
   const labels = db.prepare(
     "SELECT id, amount, currency, refundStatus, shippoTransactionId FROM shipping_labels WHERE orderId = ?"
   ).all(order.id);
@@ -2077,6 +2078,7 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
     return res.status(409).json({ error: "Label cost not verified; manual shipping review required" });
   }
   const labelCostCents = cents.reduce((sum, value) => sum + value, 0);
+  if (!Number.isSafeInteger(labelCostCents) || labelCostCents > Number.MAX_SAFE_INTEGER - 500) return res.status(409).json({ error: "Invalid total label cost" });
   const processingFeeCents = 500;
   return res.json({
     orderId: order.id, orderStatus: order.status,
@@ -2085,6 +2087,7 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
     labelRefundStatuses: labels.map(label => label.refundStatus || "UNKNOWN"),
     requiresAdminApproval: true,
     shippingConfirmationRequired: true,
+    approvalEnabled: false,
     notice: "Estimate only. Verify carrier pickup and Shippo label refund before approving or charging."
   });
 });
