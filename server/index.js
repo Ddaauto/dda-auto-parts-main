@@ -2052,26 +2052,15 @@ return res.json({ ok: true, changes: result.changes, status: newStatus, updated 
     return res.status(500).json({ error: "Failed to reject cancellation" });
   }
 });
-// Admin-only controlled Stripe refund attempt. The order is already cancelled
-// before this route can be used. A unique row and Stripe idempotency key
-// prevent duplicate refund requests; uncertain network outcomes require review.
-app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, res) => {
-  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
-  const id = String(req.params.id || "");
-  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
-  if (!order) return res.status(404).json({ error: "Order not found" });
-  if (String(order.status).toUpperCase() !== "CANCELLED" ||
-      String(order.paymentStatus).toUpperCase() !== "REFUND_PENDING" ||
-      String(order.paymentMethod).toLowerCase() === "zelle") {
-    return res.status(409).json({ error: "Cancelled card order with refund pending required" });
-  }
+async function submitCancelledStripeRefund(order, actorType = "system", actorId = null) {
+  const id = order.id;
   const claim = db.prepare(`
     INSERT OR IGNORE INTO stripe_cancellation_refunds (orderId, refundStatus)
     VALUES (?, 'REQUESTING')
   `).run(id);
   if (!claim.changes) {
     const previous = db.prepare("SELECT * FROM stripe_cancellation_refunds WHERE orderId = ?").get(id);
-    return res.status(409).json({ error: "Refund already requested or requires review", refund: previous });
+    return { ok: false, alreadyRequested: true, refund: previous };
   }
   try {
     const result = await requestFullStripeRefund({ stripe, order });
@@ -2081,7 +2070,7 @@ app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, re
           updatedAt = datetime('now')
       WHERE orderId = ?
     `).run(result.refundId, result.paymentIntentId, result.status, result.amount, id);
-    logOrderEvent(id, "STRIPE_REFUND_REQUESTED", "Stripe refund submitted; confirmation pending", "admin", req.user?.id ? String(req.user.id) : null);
+    logOrderEvent(id, "STRIPE_REFUND_REQUESTED", "Stripe refund submitted; confirmation pending", actorType, actorId);
     // Stripe can deliver refund.updated before the refund ID is persisted.
     // Reconcile directly after saving, and accept only a verified succeeded status.
     try {
@@ -2108,8 +2097,8 @@ app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, re
       console.warn("Stripe refund verification pending:", id, verificationError.message);
     }
     const current = db.prepare("SELECT paymentStatus FROM orders WHERE id = ?").get(id);
-    return res.json({ ok: true, refundId: result.refundId, stripeStatus: result.status,
-      paymentStatus: current?.paymentStatus || "REFUND_PENDING" });
+    return { ok: true, refundId: result.refundId, stripeStatus: result.status,
+      paymentStatus: current?.paymentStatus || "REFUND_PENDING" };
   } catch (error) {
     // Do not automatically retry: Stripe may have processed the request.
     db.prepare(`
@@ -2117,8 +2106,24 @@ app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, re
           lastError = ?, updatedAt = datetime('now') WHERE orderId = ?
     `).run(String(error.message || error).slice(0, 1000), id);
     console.error("Stripe cancellation refund needs review:", id, error);
-    return res.status(409).json({ error: "Refund not confirmed; manual review required. Do not resubmit." });
+    return { ok: false, reviewRequired: true };
   }
+}
+// Admin-only controlled Stripe refund attempt. The order is already cancelled
+// before this route can be used. A unique row and Stripe idempotency key
+// prevent duplicate refund requests; uncertain network outcomes require review.
+app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const id = String(req.params.id || "");
+  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (String(order.status).toUpperCase() !== "CANCELLED" ||
+      String(order.paymentStatus).toUpperCase() !== "REFUND_PENDING" ||
+      String(order.paymentMethod).toLowerCase() === "zelle") {
+    return res.status(409).json({ error: "Cancelled card order with refund pending required" });
+  }
+  const outcome = await submitCancelledStripeRefund(order, "admin", req.user?.id ? String(req.user.id) : null);
+  return res.status(outcome.ok ? 200 : 409).json(outcome);
 });
 app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
   try {
@@ -2690,6 +2695,17 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       await notifyAdminCancelRequested(order);
     } catch (e) {
       console.error("Email notify admin error:", e);
+    }
+
+    // Automatically request a full refund only after cancellation is committed.
+    // Never retry a potentially submitted refund without reconciliation.
+    if (decision.status === "CANCELLED" &&
+        String(order.paymentStatus || "").toUpperCase() === "REFUND_PENDING" &&
+        String(order.paymentMethod || "").toLowerCase() !== "zelle") {
+      const refundOutcome = await submitCancelledStripeRefund(order);
+      if (!refundOutcome.ok) {
+        console.warn("Cancelled order requires Stripe refund review:", orderId);
+      }
     }
 
     console.log("REQUEST CANCEL ORDER ID:", orderId);
