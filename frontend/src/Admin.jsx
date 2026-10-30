@@ -1455,7 +1455,7 @@ alert("CSV imported successfully");
               {status === "CANCEL_REQUESTED" && !o.shippingLabelCreated ? <>
                 <button className="btn" onClick={() => approveCancelOrder(o.id)}>Approve cancellation</button>
                 <button className="btn" onClick={() => rejectCancelOrder(o.id)}>Reject cancellation</button>
-              </> : status !== "CANCELLED" && status !== "LABEL_CREATED" && status !== "SHIPPED" && status !== "DELIVERED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
+              </> : status !== "CANCELLED" && status !== "LABEL_CREATED" && status !== "CANCEL_REQUESTED" && status !== "SHIPPED" && status !== "DELIVERED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
               {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <span>Refund: use verified settlement workflow when applicable</span> : null}
             </div>
           </div>}
