@@ -50,6 +50,24 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       // Only settle our own tracked refund; never infer completion from a charge event.
       if (event.type === "charge.refunded") return res.json({ received: true });
       const incoming = event.data.object;
+      const additional = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (additional) {
+        const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(additional.orderId);
+        if (!order || order.status !== "CANCELLED" ||
+            Number(incoming.amount) !== additional.amountCents ||
+            String(incoming.payment_intent || "") !== additional.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Additional refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        db.transaction(() => {
+          const previous = db.prepare("SELECT refundStatus FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(additional.orderId);
+          if (previous?.refundStatus === "succeeded") return;
+          db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = ? WHERE orderId = ?").run(state, additional.orderId);
+          if (state === "succeeded") db.prepare("UPDATE shippo_additional_refunds SET status = 'CONFIRMED' WHERE orderId = ? AND status IN ('PREPARED', 'STRIPE_REQUESTED')").run(additional.orderId);
+        })();
+        return res.json({ received: true });
+      }
       const partial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE stripeRefundId = ?").get(incoming.id);
       if (partial) {
         const valid = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(partial.orderId);
@@ -892,6 +910,13 @@ CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
   refundStatus TEXT NOT NULL DEFAULT 'REQUESTING',
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS stripe_shippo_additional_refunds (
+  orderId TEXT PRIMARY KEY,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING'
 );
 CREATE TABLE IF NOT EXISTS shippo_additional_refunds (
   orderId TEXT PRIMARY KEY,
@@ -2662,6 +2687,67 @@ app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequire
   } catch (error) {
     console.error("Additional Zelle refund confirmation error:", error);
     return res.status(500).json({ error: "Unable to confirm additional Zelle refund" });
+  }
+});
+// Additional Stripe refund for verified Shippo money, independent from initial refund.
+app.post("/admin/orders/:id/shippo-additional-refund/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit confirmation required" });
+    const id = String(req.params.id || "");
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const extra = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      const initial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(id);
+      if (!order || !settlement || !extra || !initial ||
+          order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" || extra.status !== "PREPARED" ||
+          initial.refundStatus !== "succeeded" || !["stripe", "card"].includes(settlement.paymentMethod)) {
+        return { error: "Initial Stripe refund or additional settlement not confirmed", code: 409 };
+      }
+      const amount = extra.amountCents;
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      if (!Number.isSafeInteger(amount) || amount <= 0 || amount > verified ||
+          initial.amountCents + amount > settlement.amountPaidCents - 500 ||
+          String(order.stripePaymentIntentId || "") !== initial.stripePaymentIntentId) {
+        return { error: "Refund amount or Stripe payment intent mismatch", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO stripe_shippo_additional_refunds
+        (orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?)`).run(id, initial.stripePaymentIntentId, amount);
+      if (!inserted.changes) return { error: "Additional Stripe refund already requested", code: 409 };
+      db.prepare("UPDATE shippo_additional_refunds SET status = 'STRIPE_REQUESTED' WHERE orderId = ? AND status = 'PREPARED'").run(id);
+      return { paymentIntentId: initial.stripePaymentIntentId, amountCents: amount };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, kind: "shippo_additional_refund" }
+      }, { idempotencyKey: `dda-shippo-additional-${id}` });
+      db.prepare("UPDATE stripe_shippo_additional_refunds SET stripeRefundId = ?, refundStatus = ? WHERE orderId = ?")
+        .run(refund.id, String(refund.status || "pending").toLowerCase(), id);
+      try {
+        const verified = await stripe.refunds.retrieve(refund.id);
+        if (verified.id === refund.id && verified.status === "succeeded" &&
+            Number(verified.amount) === claim.amountCents &&
+            String(verified.payment_intent || "") === claim.paymentIntentId) {
+          db.transaction(() => {
+            db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = 'succeeded' WHERE orderId = ?").run(id);
+            db.prepare("UPDATE shippo_additional_refunds SET status = 'CONFIRMED' WHERE orderId = ? AND status = 'STRIPE_REQUESTED'").run(id);
+          })();
+        }
+      } catch (verifyError) { console.warn("Additional Stripe refund verification pending", id, verifyError.message); }
+      return res.json({ ok: true, refundId: refund.id, amountCents: claim.amountCents,
+        confirmationPending: db.prepare("SELECT refundStatus FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(id).refundStatus !== "succeeded" });
+    } catch (error) {
+      db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = 'REVIEW_REQUIRED' WHERE orderId = ? AND refundStatus != 'succeeded'").run(id);
+      console.error("Additional Stripe refund needs manual reconciliation:", id, error);
+      return res.status(202).json({ ok: false, reviewRequired: true, message: "Reconcile Stripe before retrying" });
+    }
+  } catch (error) {
+    console.error("Additional Stripe refund failed:", error);
+    return res.status(500).json({ error: "Unable to process additional refund" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
