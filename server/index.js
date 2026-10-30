@@ -863,6 +863,18 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS label_cancellation_reviews (
+  orderId TEXT PRIMARY KEY,
+  reviewStatus TEXT NOT NULL DEFAULT 'PENDING',
+  labelCostCents INTEGER NOT NULL,
+  processingFeeCents INTEGER NOT NULL DEFAULT 500,
+  totalFeeCents INTEGER NOT NULL,
+  labelSnapshotJson TEXT NOT NULL,
+  carrierNotPickedUpConfirmed INTEGER NOT NULL DEFAULT 0,
+  adminId TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+  updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS refund_confirmation_emails (
   orderId TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'SENDING'
@@ -2090,6 +2102,53 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
     approvalEnabled: false,
     notice: "Estimate only. Verify carrier pickup and Shippo label refund before approving or charging."
   });
+});
+// Record a shipping-aware cancellation review without changing order/payment status.
+// Actual cancellation, fees and Shippo refunds require a separate approved workflow.
+app.post("/admin/orders/:id/label-cancellation-review", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id || "");
+    if (req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Explicit confirmation that carrier has not picked up the parcel is required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT id, status FROM orders WHERE id = ?").get(id);
+      if (!order) return { error: "Order not found", code: 404 };
+      if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+        return { error: "Order is not eligible for label cancellation review", code: 409 };
+      }
+      const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+      if (!labels.length) return { error: "No purchased shipping label", code: 409 };
+      let total = 0;
+      for (const label of labels) {
+        const amount = String(label.amount ?? "").trim();
+        if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
+            String(label.currency || "").toUpperCase() !== "USD" || !label.shippoTransactionId) {
+          return { error: "Unverified shipping label amount", code: 409 };
+        }
+        const cents = Math.round(Number(amount) * 100);
+        if (!Number.isSafeInteger(cents) || !Number.isSafeInteger(total + cents + 500)) {
+          return { error: "Invalid shipping label amount", code: 409 };
+        }
+        total += cents;
+      }
+      const existing = db.prepare("SELECT orderId FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (existing) return { error: "Cancellation review already exists; inspect it before proceeding", code: 409 };
+      db.prepare(`INSERT INTO label_cancellation_reviews
+        (orderId, reviewStatus, labelCostCents, processingFeeCents, totalFeeCents,
+         labelSnapshotJson, carrierNotPickedUpConfirmed, adminId)
+        VALUES (?, 'PENDING', ?, 500, ?, ?, 1, ?)`
+      ).run(id, total, total + 500, JSON.stringify(labels), String(req.user?.id || ""));
+      return { ok: true, orderId: id, reviewStatus: "PENDING", labelCostCents: total, processingFeeCents: 500, totalFeeCents: total + 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_REVIEW_CREATED", "Admin recorded pre-pickup cancellation review; no cancellation or refund executed", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Label cancellation review error:", error);
+    return res.status(500).json({ error: "Could not record cancellation review" });
+  }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
