@@ -1948,13 +1948,30 @@ app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
     }
     const labelPurchase = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id);
     if (labelPurchase) return res.status(409).json({ error: "Shipping label exists or purchase is in progress; manual shipping review required" });
-    const paid = String(order.paymentStatus || "").toUpperCase() === "PAID";
-    const result = db.prepare(`
-      UPDATE orders
-      SET status = 'CANCELLED',
-          paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING' ELSE 'CANCELLED' END
-      WHERE id = ? AND status NOT IN ('CANCELLED', 'SHIPPED', 'DELIVERED', 'LABEL_CREATED')
-    `).run(id);
+    const result = db.transaction(() => {
+      const current = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      if (!current || ["CANCELLED", "SHIPPED", "DELIVERED", "LABEL_CREATED"].includes(String(current.status || "").toUpperCase())) {
+        return { changes: 0 };
+      }
+      // Recheck the label reservation inside the cancellation transaction.
+      if (db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id)) {
+        return { changes: 0 };
+      }
+      const updated = db.prepare(`
+        UPDATE orders
+        SET status = 'CANCELLED',
+            paymentStatus = CASE
+              WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING'
+              WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING'
+              WHEN paymentStatus = 'PENDING' AND (stripeSessionId IS NOT NULL OR stripePaymentIntentId IS NOT NULL)
+                THEN 'PAYMENT_VERIFICATION_PENDING'
+              ELSE 'CANCELLED'
+            END
+        WHERE id = ? AND status NOT IN ('CANCELLED', 'SHIPPED', 'DELIVERED', 'LABEL_CREATED')
+      `).run(id);
+      if (updated.changes) restoreInventoryForCancelledOrder(db, id);
+      return updated;
+    })();
     if (!result.changes) return res.status(409).json({ error: "Order is not eligible for direct cancellation" });
 
     console.log("CANCEL ORDER ID:", id);
