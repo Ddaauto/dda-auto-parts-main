@@ -66,6 +66,10 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = ? WHERE batchId = ?").run(state, batchRefund.batchId);
           if (state === "succeeded") db.prepare("UPDATE shippo_additional_refund_batches SET status = 'CONFIRMED' WHERE id = ? AND orderId = ? AND status = 'STRIPE_REQUESTED'").run(batchRefund.batchId, batchRefund.orderId);
         })();
+        if (state === "succeeded") {
+          try { await notifyCustomerPartialRefundOnce(batchRefund.orderId, `shippo-stripe-batch:${batchRefund.batchId}`, batchRefund.amountCents, "Stripe"); }
+          catch (error) { console.error("Shippo Stripe email requires review:", error); }
+        }
         return res.json({ received: true });
       }
       const additional = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE stripeRefundId = ?").get(incoming.id);
@@ -84,6 +88,10 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = ? WHERE orderId = ?").run(state, additional.orderId);
           if (state === "succeeded") db.prepare("UPDATE shippo_additional_refunds SET status = 'CONFIRMED' WHERE orderId = ? AND status IN ('PREPARED', 'STRIPE_REQUESTED')").run(additional.orderId);
         })();
+        if (state === "succeeded") {
+          try { await notifyCustomerPartialRefundOnce(additional.orderId, `shippo-stripe-first:${additional.orderId}`, additional.amountCents, "Stripe"); }
+          catch (error) { console.error("Shippo Stripe email requires review:", error); }
+        }
         return res.json({ received: true });
       }
       const partial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE stripeRefundId = ?").get(incoming.id);
@@ -2744,7 +2752,7 @@ app.post("/admin/orders/:id/shippo-additional-refund/prepare", authRequired, (re
   }
 });
 // Confirm an additional Zelle refund already transferred to the customer.
-app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequired, (req, res) => {
+app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
     if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm Zelle transfer was sent" });
@@ -2777,6 +2785,8 @@ app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequire
     if (result.error) return res.status(result.code).json({ error: result.error });
     logOrderEvent(id, "SHIPPO_ADDITIONAL_ZELLE_REFUND_CONFIRMED",
       "Admin confirmed additional Zelle transfer with reference", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerPartialRefundOnce(id, `shippo-zelle-first:${id}`, result.amountCents, "Zelle"); }
+    catch (error) { console.error("First Shippo Zelle email requires review:", error); }
     return res.json(result);
   } catch (error) {
     console.error("Additional Zelle refund confirmation error:", error);
