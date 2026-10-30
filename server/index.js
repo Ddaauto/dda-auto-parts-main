@@ -2881,7 +2881,7 @@ app.post("/admin/orders/:id/shippo-additional-refund/prepare-next-batch", authRe
   }
 });
 // Confirm a later Shippo-funded Zelle batch only after the transfer has been sent.
-app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-zelle", authRequired, (req, res) => {
+app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-zelle", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
     if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm transfer was actually sent" });
@@ -2921,6 +2921,8 @@ app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-ze
     })();
     if (result.error) return res.status(result.code).json({ error: result.error });
     logOrderEvent(id, "SHIPPO_ZELLE_BATCH_CONFIRMED", "Admin confirmed later Zelle transfer", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerPartialRefundOnce(id, `shippo-zelle-batch:${result.batchId}`, result.amountCents, "Zelle"); }
+    catch (error) { console.error("Shippo Zelle batch email requires review:", error); }
     return res.json(result);
   } catch (error) {
     console.error("Shippo Zelle batch confirmation failed:", error);
