@@ -693,7 +693,9 @@ async function notifyCustomerRefundConfirmedOnce(orderId) {
     await sendEmail({
       to: order.customerEmail,
       subject: `Refund confirmed - ${order.orderNumber || order.id} | DDA Auto Parts`,
-      text: `Your refund for cancelled order ${order.orderNumber || order.id} has been confirmed by the payment processor. Please allow your payment provider time to post the credit.`
+      text: String(order.paymentMethod || "").toLowerCase() === "zelle"
+        ? `DDA Auto Parts has recorded the Zelle refund for cancelled order ${order.orderNumber || order.id} as sent. Please check your receiving account.`
+        : `Your refund for cancelled order ${order.orderNumber || order.id} has been confirmed by the payment processor. Please allow your payment provider time to post the credit.`
     });
     db.prepare("UPDATE refund_confirmation_emails SET status = 'SENT' WHERE orderId = ?").run(orderId);
     return true;
@@ -2312,11 +2314,9 @@ console.log("REFUND order for emails:", order);
     } catch (e) {
       console.error("Email notify admin refund error:", e);
     }
-try {
-  await notifyCustomerRefunded(order);
-} catch (e) {
-  console.error("Email notify customer refund error:", e);
-}
+// The shared notification claim prevents duplicate confirmation emails.
+    // This manual Zelle confirmation is recorded only after ADMIN attests payment was sent.
+    await notifyCustomerRefundConfirmedOnce(id);
     return res.json({ ok: true, changes: result.changes });
   } catch (e) {
     console.error("❌ refund error:", e);
