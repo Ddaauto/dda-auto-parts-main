@@ -2082,8 +2082,34 @@ app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, re
       WHERE orderId = ?
     `).run(result.refundId, result.paymentIntentId, result.status, result.amount, id);
     logOrderEvent(id, "STRIPE_REFUND_REQUESTED", "Stripe refund submitted; confirmation pending", "admin", req.user?.id ? String(req.user.id) : null);
+    // Stripe can deliver refund.updated before the refund ID is persisted.
+    // Reconcile directly after saving, and accept only a verified succeeded status.
+    try {
+      const verified = await stripe.refunds.retrieve(result.refundId);
+      if (verified.id === result.refundId &&
+          verified.status === "succeeded" &&
+          verified.amount === result.amount &&
+          String(verified.payment_intent || "") === result.paymentIntentId) {
+        db.transaction(() => {
+          db.prepare(`
+            UPDATE stripe_cancellation_refunds
+            SET refundStatus = 'succeeded', updatedAt = datetime('now')
+            WHERE orderId = ? AND stripeRefundId = ?
+          `).run(id, result.refundId);
+          db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUNDED'
+            WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
+          `).run(id);
+        })();
+        logOrderEvent(id, "STRIPE_REFUND_CONFIRMED", "Stripe refund succeeded (verified by API)", "system", null);
+      }
+    } catch (verificationError) {
+      // The refund request was already submitted: never issue a second refund.
+      console.warn("Stripe refund verification pending:", id, verificationError.message);
+    }
+    const current = db.prepare("SELECT paymentStatus FROM orders WHERE id = ?").get(id);
     return res.json({ ok: true, refundId: result.refundId, stripeStatus: result.status,
-      paymentStatus: "REFUND_PENDING" });
+      paymentStatus: current?.paymentStatus || "REFUND_PENDING" });
   } catch (error) {
     // Do not automatically retry: Stripe may have processed the request.
     db.prepare(`
