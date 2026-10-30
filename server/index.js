@@ -62,19 +62,29 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         return res.status(409).json({ error: "Refund/order mismatch" });
       }
       const newStatus = String(incoming.status || "").toLowerCase();
-      db.transaction(() => {
+      if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(newStatus)) {
+        console.warn("Unrecognized Stripe refund status:", newStatus);
+        return res.json({ received: true });
+      }
+      // Webhooks can arrive out of order. Never downgrade a confirmed refund.
+      const updated = db.transaction(() => {
+        const latest = db.prepare(
+          "SELECT refundStatus FROM stripe_cancellation_refunds WHERE orderId = ?"
+        ).get(tracked.orderId);
+        if (String(latest?.refundStatus || "").toLowerCase() === "succeeded") return false;
         db.prepare(`
           UPDATE stripe_cancellation_refunds
           SET refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?
         `).run(newStatus, tracked.orderId);
         if (newStatus === "succeeded") {
-          db.prepare(`
+          return !!db.prepare(`
             UPDATE orders SET paymentStatus = 'REFUNDED'
             WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
-          `).run(tracked.orderId);
+          `).run(tracked.orderId).changes;
         }
+        return false;
       })();
-      if (newStatus === "succeeded") {
+      if (updated) {
         logOrderEvent(tracked.orderId, "STRIPE_REFUND_CONFIRMED", "Stripe confirmed refund succeeded", "system", null);
       }
       return res.json({ received: true });
