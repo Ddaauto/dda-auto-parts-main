@@ -2304,6 +2304,51 @@ app.post("/admin/orders/:id/label-cancellation-settlement/prepare", authRequired
     return res.status(500).json({ error: "Could not prepare settlement" });
   }
 });
+// Explicitly cancel a prepared, approved pre-pickup order.
+// Financial settlement remains separately pending; never call the full-refund helper.
+app.post("/admin/orders/:id/label-cancellation-settlement/cancel-order", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmCancellation !== true || req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Explicit cancellation and no-pickup confirmations required" });
+    }
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !review || !settlement ||
+          review.reviewStatus !== "APPROVED" || settlement.status !== "PREPARED" ||
+          !["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase()) ||
+          String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+        return { error: "Cancellation review, payment or settlement not eligible", code: 409 };
+      }
+      const labels = db.prepare(
+        "SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id"
+      ).all(id);
+      if (!labels.length || JSON.stringify(labels) !== review.labelSnapshotJson ||
+          settlement.labelCostCents !== review.labelCostCents ||
+          settlement.initialRefundCents !== settlement.amountPaidCents - review.totalFeeCents) {
+        return { error: "Shipping or financial records changed", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE orders SET status = 'CANCELLED', paymentStatus = 'REFUND_PENDING'
+        WHERE id = ? AND paymentStatus = 'PAID' AND status IN ('LABEL_CREATED', 'CANCEL_REQUESTED')`).run(id);
+      if (!changed.changes) return { error: "Order status changed", code: 409 };
+      restoreInventoryForCancelledOrder(db, id);
+      db.prepare("UPDATE label_cancellation_settlements SET status = 'CANCELLED_REFUND_PENDING' WHERE orderId = ? AND status = 'PREPARED'").run(id);
+      return { ok: true, orderId: id, orderCancelled: true, refundSubmitted: false,
+        initialRefundCents: settlement.initialRefundCents, paymentMethod: settlement.paymentMethod };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_ORDER_CANCELLED", "Order cancelled; partial refund awaiting execution", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(id)); }
+    catch (error) { console.error("Label cancellation email failed:", error); }
+    return res.json(result);
+  } catch (error) {
+    console.error("Label cancellation failed:", error);
+    return res.status(500).json({ error: "Failed to cancel label order" });
+  }
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
