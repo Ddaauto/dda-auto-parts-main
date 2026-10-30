@@ -2543,7 +2543,12 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       const result = db.prepare(`
         UPDATE orders
         SET status = 'CANCELLED',
-            paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING' ELSE 'CANCELLED' END
+            paymentStatus = CASE
+              WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING'
+              WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING'
+              WHEN paymentStatus = 'PENDING' AND (stripeSessionId IS NOT NULL OR stripePaymentIntentId IS NOT NULL) THEN 'PAYMENT_VERIFICATION_PENDING'
+              ELSE 'CANCELLED'
+            END
         WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')
       `).run(orderId, customerId);
       return { result, status: "CANCELLED" };
