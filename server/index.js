@@ -17,6 +17,7 @@ import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
 import stripeRoutes from "./routes/stripe.js";
+import { requestFullStripeRefund } from "./services/stripeCancellationRefund.js";
 import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
@@ -992,6 +993,19 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_stripePaymentIntentId
   ON orders(stripePaymentIntentId)
   WHERE stripePaymentIntentId IS NOT NULL
+`);
+
+// Track Stripe refund requests separately from order payment state.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stripe_cancellation_refunds (
+    orderId TEXT PRIMARY KEY,
+    stripeRefundId TEXT UNIQUE,
+    stripePaymentIntentId TEXT,
+    refundStatus TEXT NOT NULL DEFAULT 'NOT_REQUESTED',
+    amountCents INTEGER,
+    lastError TEXT,
+    updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 // =====================================================
@@ -2003,6 +2017,48 @@ return res.json({ ok: true, changes: result.changes, status: newStatus, updated 
   } catch (e) {
     console.error("❌ reject cancel error:", e);
     return res.status(500).json({ error: "Failed to reject cancellation" });
+  }
+});
+// Admin-only controlled Stripe refund attempt. The order is already cancelled
+// before this route can be used. A unique row and Stripe idempotency key
+// prevent duplicate refund requests; uncertain network outcomes require review.
+app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const id = String(req.params.id || "");
+  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (String(order.status).toUpperCase() !== "CANCELLED" ||
+      String(order.paymentStatus).toUpperCase() !== "REFUND_PENDING" ||
+      String(order.paymentMethod).toLowerCase() === "zelle") {
+    return res.status(409).json({ error: "Cancelled card order with refund pending required" });
+  }
+  const claim = db.prepare(`
+    INSERT OR IGNORE INTO stripe_cancellation_refunds (orderId, refundStatus)
+    VALUES (?, 'REQUESTING')
+  `).run(id);
+  if (!claim.changes) {
+    const previous = db.prepare("SELECT * FROM stripe_cancellation_refunds WHERE orderId = ?").get(id);
+    return res.status(409).json({ error: "Refund already requested or requires review", refund: previous });
+  }
+  try {
+    const result = await requestFullStripeRefund({ stripe, order });
+    db.prepare(`
+      UPDATE stripe_cancellation_refunds
+      SET stripeRefundId = ?, stripePaymentIntentId = ?, refundStatus = ?, amountCents = ?,
+          updatedAt = datetime('now')
+      WHERE orderId = ?
+    `).run(result.refundId, result.paymentIntentId, result.status, result.amount, id);
+    logOrderEvent(id, "STRIPE_REFUND_REQUESTED", "Stripe refund submitted; confirmation pending", "admin", req.user?.id ? String(req.user.id) : null);
+    return res.json({ ok: true, refundId: result.refundId, stripeStatus: result.status,
+      paymentStatus: "REFUND_PENDING" });
+  } catch (error) {
+    // Do not automatically retry: Stripe may have processed the request.
+    db.prepare(`
+      UPDATE stripe_cancellation_refunds SET refundStatus = 'REVIEW_REQUIRED',
+          lastError = ?, updatedAt = datetime('now') WHERE orderId = ?
+    `).run(String(error.message || error).slice(0, 1000), id);
+    console.error("Stripe cancellation refund needs review:", id, error);
+    return res.status(409).json({ error: "Refund not confirmed; manual review required. Do not resubmit." });
   }
 });
 app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
