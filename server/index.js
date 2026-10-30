@@ -918,6 +918,15 @@ CREATE TABLE IF NOT EXISTS stripe_shippo_additional_refunds (
   stripeRefundId TEXT UNIQUE,
   refundStatus TEXT NOT NULL DEFAULT 'REQUESTING'
 );
+CREATE TABLE IF NOT EXISTS shippo_additional_refund_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  orderId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT NOT NULL,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shippo_additional_refund_batches_order ON shippo_additional_refund_batches(orderId);
 CREATE TABLE IF NOT EXISTS shippo_additional_refunds (
   orderId TEXT PRIMARY KEY,
   amountCents INTEGER NOT NULL,
@@ -2748,6 +2757,42 @@ app.post("/admin/orders/:id/shippo-additional-refund/refund-stripe", authRequire
   } catch (error) {
     console.error("Additional Stripe refund failed:", error);
     return res.status(500).json({ error: "Unable to process additional refund" });
+  }
+});
+// Reserve a later Shippo receipt batch without moving money. Existing first-batch flow stays unchanged.
+app.post("/admin/orders/:id/shippo-additional-refund/prepare-next-batch", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "Explicit confirmation required" });
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT amountCents, status FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          !settlement || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          !first || first.status !== "CONFIRMED") {
+        return { error: "First additional refund must be confirmed before another batch", code: 409 };
+      }
+      const pending = db.prepare("SELECT id FROM shippo_additional_refund_batches WHERE orderId = ? AND status != 'CONFIRMED' LIMIT 1").get(id);
+      if (pending) return { error: "Existing batch requires completion or review", code: 409 };
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const prior = db.prepare("SELECT COALESCE(SUM(amountCents), 0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ?").get(id).cents;
+      const available = verified - first.amountCents - prior;
+      if (!Number.isSafeInteger(available) || available <= 0 ||
+          settlement.initialRefundCents + first.amountCents + prior + available > settlement.amountPaidCents - 500) {
+        return { error: "No new verified Shippo funds available", code: 409 };
+      }
+      const inserted = db.prepare("INSERT INTO shippo_additional_refund_batches (orderId, amountCents, createdBy) VALUES (?, ?, ?)").run(id, available, String(req.user?.id || "admin"));
+      return { ok: true, batchId: inserted.lastInsertRowid, orderId: id, amountCents: available,
+        status: "PREPARED", fundsSent: false, processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_BATCH_PREPARED", "Later verified Shippo refund reserved; no transfer made", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Shippo next batch preparation failed:", error);
+    return res.status(500).json({ error: "Unable to prepare later Shippo refund batch" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
