@@ -893,6 +893,15 @@ CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS shippo_label_refund_verifications (
+  shippoTransactionId TEXT PRIMARY KEY,
+  orderId TEXT NOT NULL,
+  labelId TEXT NOT NULL,
+  verifiedAmountCents INTEGER NOT NULL,
+  evidenceReference TEXT NOT NULL,
+  verifiedBy TEXT NOT NULL,
+  verifiedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS label_cancellation_settlements (
   orderId TEXT PRIMARY KEY,
   paymentMethod TEXT NOT NULL,
@@ -2520,6 +2529,54 @@ app.get("/admin/orders/:id/shippo-refund-reconciliation", authRequired, (req, re
   } catch (error) {
     console.error("Shippo refund reconciliation error:", error);
     return res.status(500).json({ error: "Could not reconcile Shippo label refunds" });
+  }
+});
+// Record documentary evidence of an actual Shippo refund, without sending customer funds.
+app.post("/admin/orders/:id/shippo-refund-verification", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.fundsReceivedConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm Shippo refund funds were actually received" });
+    }
+    const id = String(req.params.id || "");
+    const transactionId = String(req.body?.shippoTransactionId || "").trim();
+    const evidence = String(req.body?.evidenceReference || "").trim();
+    const amountCents = Number(req.body?.verifiedAmountCents);
+    if (!transactionId || !evidence || evidence.length > 500 ||
+        !Number.isSafeInteger(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ error: "Valid transaction, positive amount and evidence required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || !settlement ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED") {
+        return { error: "Initial refund must be confirmed before recording Shippo funds", code: 409 };
+      }
+      const label = db.prepare("SELECT id, amount, currency FROM shipping_labels WHERE orderId = ? AND shippoTransactionId = ?").get(id, transactionId);
+      if (!label || String(label.currency).toUpperCase() !== "USD" ||
+          !/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(String(label.amount))) {
+        return { error: "Label amount or currency invalid", code: 409 };
+      }
+      const labelCents = Math.round(Number(label.amount) * 100);
+      if (amountCents > labelCents) return { error: "Verified refund exceeds label cost", code: 409 };
+      const prior = db.prepare("SELECT shippoTransactionId FROM shippo_label_refund_verifications WHERE shippoTransactionId = ?").get(transactionId);
+      if (prior) return { error: "Shippo transaction already verified", code: 409 };
+      const sum = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      if (sum + amountCents > settlement.labelCostCents) return { error: "Verified funds exceed settlement label costs", code: 409 };
+      db.prepare(`INSERT INTO shippo_label_refund_verifications
+        (shippoTransactionId, orderId, labelId, verifiedAmountCents, evidenceReference, verifiedBy)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(transactionId, id, label.id, amountCents, evidence, String(req.user?.id || "admin"));
+      return { ok: true, orderId: id, shippoTransactionId: transactionId,
+        verifiedAmountCents: amountCents, totalVerifiedCents: sum + amountCents,
+        additionalCustomerRefundSubmitted: false };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_REFUND_FUNDS_VERIFIED", "Admin recorded received Shippo funds with evidence", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Shippo refund verification failed:", error);
+    return res.status(500).json({ error: "Unable to verify Shippo refund" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
