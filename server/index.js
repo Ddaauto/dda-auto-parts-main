@@ -78,7 +78,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             String(session.currency).toLowerCase() !== "usd") {
           throw new Error("Quote checkout total mismatch");
         }
-        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card' WHERE id = ?").run(order.id);
+        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card', stripePaymentIntentId = COALESCE(stripePaymentIntentId, ?) WHERE id = ?").run(typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id || null, order.id);
         deductInventoryOnceForPaidOrder(db, order.id);
         return { orderId: order.id, alreadyPaid: false };
       })();
@@ -279,6 +279,10 @@ JSON.stringify(cleanItems),
 "PAID",
 session.id
 );
+  db.prepare("UPDATE orders SET stripePaymentIntentId = ? WHERE id = ?").run(
+    typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id || null,
+    orderId
+  );
   deductInventoryOnceForPaidOrder(db, orderId);
   return orderId;
 });
