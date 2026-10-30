@@ -6,6 +6,7 @@ import AdminShippingBoxes from "./AdminShippingBoxes";
 import AdminShippoRates from "./AdminShippoRates";
 import AdminShippingLabelDetails from "./AdminShippingLabelDetails";
 import AdminShippingOrigin from "./AdminShippingOrigin";
+import AdminCancellationSettlement from "./AdminCancellationSettlement";
 const API_BASE = "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
 // VITE_ADMIN_USER=admin
@@ -1451,13 +1452,14 @@ alert("CSV imported successfully");
             {items.length > 2 && <div style={{ marginTop: 14 }}>{items.slice(2).map((item, i) => <div key={i} style={{ padding: "5px 0" }}>{item.name || item.sku || "Product"} · Qty {item.qty || item.quantity || 1}</div>)}</div>}
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
               {status === "LABEL_CREATED" && <button className="btn" type="button" onClick={() => previewLabelCancellation(o.id)}>Review cancellation fees (no changes)</button>}
-              {status === "CANCEL_REQUESTED" ? <>
+              {status === "CANCEL_REQUESTED" && !o.shippingLabelCreated ? <>
                 <button className="btn" onClick={() => approveCancelOrder(o.id)}>Approve cancellation</button>
                 <button className="btn" onClick={() => rejectCancelOrder(o.id)}>Reject cancellation</button>
-              </> : status !== "CANCELLED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
-              {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <button className="btn" onClick={() => markRefunded(o.id)}>Refund</button> : null}
+              </> : status !== "CANCELLED" && status !== "LABEL_CREATED" && status !== "SHIPPED" && status !== "DELIVERED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
+              {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <span>Refund: use verified settlement workflow when applicable</span> : null}
             </div>
           </div>}
+          {expandedOrderDetails[o.id] && ["LABEL_CREATED", "CANCEL_REQUESTED", "CANCELLED"].includes(status) && <AdminCancellationSettlement order={o} api={API} onChanged={loadOrders} />}
           {orderEventsOpen[o.id] && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
             <strong>Order history</strong>
             {orderEventsLoading[o.id] ? <p>Loading history...</p> : !(orderEventsById[o.id] || []).length ? <p>No history available.</p> : (orderEventsById[o.id] || []).map(ev => <div key={ev.id} style={{ marginTop: 10, padding: 10, background: "#f8fafc", borderRadius: 8 }}>
