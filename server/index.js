@@ -86,6 +86,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
       })();
       if (updated) {
         logOrderEvent(tracked.orderId, "STRIPE_REFUND_CONFIRMED", "Stripe confirmed refund succeeded", "system", null);
+        await notifyCustomerRefundConfirmedOnce(tracked.orderId);
       }
       return res.json({ received: true });
     }
@@ -674,6 +675,34 @@ async function notifyCustomerCancellationStatus(order) {
   });
   return true;
 }
+// One delivery attempt per refund. An uncertain email outcome is left for
+// manual review rather than risking duplicate customer notifications.
+async function notifyCustomerRefundConfirmedOnce(orderId) {
+  const order = db.prepare(`
+    SELECT o.*, c.email AS customerEmail FROM orders o
+    LEFT JOIN customers c ON c.id = o.customerId WHERE o.id = ?
+  `).get(orderId);
+  if (!order || String(order.status).toUpperCase() !== "CANCELLED" ||
+      String(order.paymentStatus).toUpperCase() !== "REFUNDED" || !order.customerEmail) return false;
+  const claimed = db.prepare(`
+    INSERT OR IGNORE INTO refund_confirmation_emails (orderId, status)
+    VALUES (?, 'SENDING')
+  `).run(orderId);
+  if (!claimed.changes) return false;
+  try {
+    await sendEmail({
+      to: order.customerEmail,
+      subject: `Refund confirmed - ${order.orderNumber || order.id} | DDA Auto Parts`,
+      text: `Your refund for cancelled order ${order.orderNumber || order.id} has been confirmed by the payment processor. Please allow your payment provider time to post the credit.`
+    });
+    db.prepare("UPDATE refund_confirmation_emails SET status = 'SENT' WHERE orderId = ?").run(orderId);
+    return true;
+  } catch (err) {
+    db.prepare("UPDATE refund_confirmation_emails SET status = 'REVIEW_REQUIRED' WHERE orderId = ?").run(orderId);
+    console.error("Refund confirmation email requires review:", orderId, err);
+    return false;
+  }
+}
 // ===== NOTIFY ADMIN (cancel request) =====
 async function notifyAdminCancelRequested(order) {
   console.log("NOTIFY ADMIN CANCEL REQUEST:", order);
@@ -832,6 +861,10 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS refund_confirmation_emails (
+  orderId TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'SENDING'
+);
 CREATE TABLE IF NOT EXISTS inventory_cancellation_restorations (
   orderId TEXT PRIMARY KEY,
   restoredAt TEXT NOT NULL DEFAULT (datetime('now'))
@@ -2187,6 +2220,7 @@ async function submitCancelledStripeRefund(order, actorType = "system", actorId 
           `).run(id);
         })();
         logOrderEvent(id, "STRIPE_REFUND_CONFIRMED", "Stripe refund succeeded (verified by API)", "system", null);
+        await notifyCustomerRefundConfirmedOnce(id);
       }
     } catch (verificationError) {
       // The refund request was already submitted: never issue a second refund.
