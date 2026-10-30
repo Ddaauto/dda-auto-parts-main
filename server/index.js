@@ -2349,6 +2349,44 @@ app.post("/admin/orders/:id/label-cancellation-settlement/cancel-order", authReq
     return res.status(500).json({ error: "Failed to cancel label order" });
   }
 });
+// Manual Zelle partial refund: ADMIN confirms transfer already sent.
+// Never send money automatically or use the full-refund endpoint.
+app.post("/admin/orders/:id/label-cancellation-settlement/confirm-zelle-refund", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm the exact partial Zelle refund was actually sent" });
+    }
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !settlement || settlement.status !== "CANCELLED_REFUND_PENDING" ||
+          String(order.status || "").toUpperCase() !== "CANCELLED" ||
+          String(order.paymentStatus || "").toUpperCase() !== "REFUND_PENDING" ||
+          String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle") {
+        return { error: "No eligible pending Zelle partial refund", code: 409 };
+      }
+      if (Number(req.body?.amountCents) !== settlement.initialRefundCents ||
+          !Number.isSafeInteger(settlement.initialRefundCents) || settlement.initialRefundCents < 0) {
+        return { error: "Confirmed Zelle transfer amount must match the settlement exactly", code: 409 };
+      }
+      db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ?").run(id);
+      db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(id);
+      return { ok: true, orderId: id, status: "INITIAL_REFUND_CONFIRMED",
+        amountCents: settlement.initialRefundCents, paymentStatus: "PARTIALLY_REFUNDED" };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "ZELLE_PARTIAL_REFUND_CONFIRMED",
+      "Admin confirmed partial Zelle refund sent", "admin", String(req.user?.id || ""),
+      { amountCents: outcome.amountCents });
+    return res.json(outcome);
+  } catch (error) {
+    console.error("Confirm partial Zelle refund error:", error);
+    return res.status(500).json({ error: "Unable to confirm partial Zelle refund" });
+  }
+});
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
