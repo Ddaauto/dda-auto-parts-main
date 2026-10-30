@@ -56,6 +56,14 @@ export default function AdminCancellationSettlement({ order, api, onChanged }) {
       ...(first ? {} : { transferReference: transferReference.trim() }) },
       `Confirm that ${money(cents)} was ALREADY transferred by Zelle. Do not use this button to send money.`);
   }
+  function batchAction(stripe) {
+    const raw = window.prompt("Existing prepared Shippo batch ID (numeric):");
+    if (!raw || !/^[1-9]\\d*$/.test(raw)) return setError("Valid batch ID required");
+    const path = `shippo-additional-refund/batches/${raw}/${stripe ? "refund-stripe" : "confirm-zelle"}`;
+    if (stripe) request(path, "POST", { confirmRefund: true },
+      "Submit a REAL Stripe refund for this prepared batch? Verify its amount and status first.");
+    else confirmZelle(path);
+  }
   const button = (label, callback) => <button type="button" className="btn" disabled={busy} onClick={callback}>{label}</button>;
   return <div style={{ marginTop: 12, padding: 12, border: "1px solid #cbd5e1", borderRadius: 8 }}>
     <strong>Label cancellation & Shippo refund review</strong>
@@ -79,7 +87,8 @@ export default function AdminCancellationSettlement({ order, api, onChanged }) {
         {zelle ? button("Confirm first additional Zelle", () => confirmZelle("shippo-additional-refund/confirm-zelle"))
           : button("Issue first additional Stripe", () => request("shippo-additional-refund/refund-stripe", "POST", { confirmRefund: true }, "This submits a REAL additional Stripe refund."))}
         {button("Prepare next Shippo batch", () => request("shippo-additional-refund/prepare-next-batch", "POST", { confirmPrepare: true }, "Prepare next batch of verified Shippo funds?"))}
-        {button("Review batches", () => request("shippo-refund-reconciliation"))}
+        {zelle ? button("Confirm later Zelle batch", () => batchAction(false))
+          : button("Issue later Stripe batch", () => batchAction(true))}
       </>}
     </div>
     {status === "CANCELLED" && <p style={{ fontSize: 12 }}>Later refund batches require their batch ID and separate confirmation; do not assume Shippo's status means money was received.</p>}
