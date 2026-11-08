@@ -24,8 +24,6 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     try { items = JSON.parse(row?.itemsJson || "[]"); } catch { items = []; }
     return shipmentProgress(items, labels);
   };
-  const accepted = status => ["TRANSIT","DELIVERED","OUT_FOR_DELIVERY","FAILURE","RETURNED"].includes(status);
-  const delivery = status => status === "DELIVERED";
   router.get("/orders/:id/tracking", (req, res) => {
     const customerId = req.user?.customerId;
     if (!customerId) return res.status(403).json({ error: "Customer account required" });
@@ -38,17 +36,14 @@ export default function createCustomerTrackingRouter(db, authRequired) {
       number: label.trackingNumber, url: label.trackingUrl, labelCreatedAt: label.purchasedAt,
       carrierStatus: label.carrierTrackingStatus || "", checkedAt: label.carrierTrackingCheckedAt || null
     }));
-    const pickedUp = labels.filter(label => accepted(label.carrierTrackingStatus || "")).length;
-    const delivered = labels.filter(label => delivery(label.carrierTrackingStatus || "")).length;
-    const complete = progress(order.id, labels).complete;
-    const shippingStatus = !labels.length ? "NOT_LABELED"
-      : complete && delivered === labels.length ? "DELIVERED"
-      : complete && pickedUp === labels.length ? "SHIPPED"
-      : pickedUp > 0 ? "PARTIALLY_SHIPPED" : "LABEL_CREATED";
+    const state = progress(order.id, labels);
+    const { pickedUp, delivered, complete, status: shippingStatus } = state;
+    const allPackagesAccepted = complete && labels.length > 0 && pickedUp === labels.length
+      && !["RETURNED", "DELIVERY_FAILURE", "UNVERIFIED"].includes(shippingStatus);
     return res.json({
       orderId: order.id, orderNumber: order.orderNumber,
       shippingStatus, carrierAcceptanceConfirmed: pickedUp > 0,
-      allPackagesAccepted: complete && labels.length > 0 && pickedUp === labels.length,
+      allPackagesAccepted,
       allItemsLabeled: complete, packageCount: labels.length, pickedUpCount: pickedUp, deliveredCount: delivered,
       deliveredAt: order.deliveredAt || null,
       tracking: tracking[0] || null, packages: tracking
@@ -79,13 +74,11 @@ export default function createCustomerTrackingRouter(db, authRequired) {
       db.transaction(()=>{
         db.prepare("UPDATE shipping_labels SET carrierTrackingStatus = ?, carrierTrackingCheckedAt = ? WHERE id = ?").run(status,now,label.id);
         const all = activeLabels(order.id);
-        const deliveredAll = all.length > 0 && all.every(item => item.carrierTrackingStatus === "DELIVERED");
-        const pickedUpAll = all.length > 0 && all.every(item =>
-          ["TRANSIT","OUT_FOR_DELIVERY","DELIVERED","RETURNED","FAILURE"].includes(item.carrierTrackingStatus));
-        if (deliveredAll && progress(order.id, all).complete) {
+        const state = progress(order.id, all);
+        if (state.status === "DELIVERED") {
           db.prepare("UPDATE orders SET status = 'DELIVERED' WHERE id = ? AND status IN ('LABEL_CREATED', 'SHIPPED')").run(order.id);
           db.prepare("UPDATE orders SET deliveredAt = COALESCE(deliveredAt, ?) WHERE id = ?").run(deliveryDate || now,order.id);
-        } else if (pickedUpAll && progress(order.id, all).complete) {
+        } else if (state.status === "SHIPPED") {
           db.prepare("UPDATE orders SET status = 'SHIPPED' WHERE id = ? AND status = 'LABEL_CREATED'").run(order.id);
         }
       })();
