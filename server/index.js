@@ -16,7 +16,8 @@ import crypto from "crypto";
 import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
-import stripeRoutes from "./routes/stripe.js";
+import createStripeRouter from "./routes/stripe.js";
+import { requestFullStripeRefund } from "./services/stripeCancellationRefund.js";
 import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 console.log("✅ Stripe loaded:", !!process.env.STRIPE_SECRET_KEY);
@@ -45,6 +46,120 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
   }
 
   try {
+    if (event.type === "refund.updated" || event.type === "refund.created" || event.type === "charge.refunded") {
+      // Only settle our own tracked refund; never infer completion from a charge event.
+      if (event.type === "charge.refunded") return res.json({ received: true });
+      const incoming = event.data.object;
+      const batchRefund = db.prepare("SELECT * FROM stripe_shippo_batch_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (batchRefund) {
+        const batchOrder = db.prepare("SELECT status FROM orders WHERE id = ?").get(batchRefund.orderId);
+        if (!batchOrder || batchOrder.status !== "CANCELLED" ||
+            Number(incoming.amount) !== batchRefund.amountCents ||
+            String(incoming.payment_intent || "") !== batchRefund.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Shippo batch refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        db.transaction(() => {
+          const prior = db.prepare("SELECT refundStatus FROM stripe_shippo_batch_refunds WHERE batchId = ?").get(batchRefund.batchId);
+          if (prior?.refundStatus === "succeeded") return;
+          db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = ? WHERE batchId = ?").run(state, batchRefund.batchId);
+          if (state === "succeeded") db.prepare("UPDATE shippo_additional_refund_batches SET status = 'CONFIRMED' WHERE id = ? AND orderId = ? AND status = 'STRIPE_REQUESTED'").run(batchRefund.batchId, batchRefund.orderId);
+        })();
+        if (state === "succeeded") {
+          try { await notifyCustomerPartialRefundOnce(batchRefund.orderId, `shippo-stripe-batch:${batchRefund.batchId}`, batchRefund.amountCents, "Stripe"); }
+          catch (error) { console.error("Shippo Stripe email requires review:", error); }
+        }
+        return res.json({ received: true });
+      }
+      const additional = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (additional) {
+        const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(additional.orderId);
+        if (!order || order.status !== "CANCELLED" ||
+            Number(incoming.amount) !== additional.amountCents ||
+            String(incoming.payment_intent || "") !== additional.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Additional refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        db.transaction(() => {
+          const previous = db.prepare("SELECT refundStatus FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(additional.orderId);
+          if (previous?.refundStatus === "succeeded") return;
+          db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = ? WHERE orderId = ?").run(state, additional.orderId);
+          if (state === "succeeded") db.prepare("UPDATE shippo_additional_refunds SET status = 'CONFIRMED' WHERE orderId = ? AND status IN ('PREPARED', 'STRIPE_REQUESTED')").run(additional.orderId);
+        })();
+        if (state === "succeeded") {
+          try { await notifyCustomerPartialRefundOnce(additional.orderId, `shippo-stripe-first:${additional.orderId}`, additional.amountCents, "Stripe"); }
+          catch (error) { console.error("Shippo Stripe email requires review:", error); }
+        }
+        return res.json({ received: true });
+      }
+      const partial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE stripeRefundId = ?").get(incoming.id);
+      if (partial) {
+        const valid = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(partial.orderId);
+        if (!valid || valid.status !== "CANCELLED" ||
+            Number(incoming.amount) !== partial.amountCents ||
+            String(incoming.payment_intent || "") !== partial.stripePaymentIntentId) {
+          return res.status(409).json({ error: "Partial refund mismatch" });
+        }
+        const state = String(incoming.status || "").toLowerCase();
+        if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(state)) return res.json({ received: true });
+        const confirmed = db.transaction(() => {
+          const current = db.prepare("SELECT refundStatus FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(partial.orderId);
+          if (current?.refundStatus === "succeeded") return false;
+          db.prepare("UPDATE stripe_partial_cancellation_refunds SET refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?").run(state, partial.orderId);
+          if (state !== "succeeded") return false;
+          db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ? AND status = 'CANCELLED_REFUND_PENDING'").run(partial.orderId);
+          return !!db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(partial.orderId).changes;
+        })();
+        if (confirmed) logOrderEvent(partial.orderId, "STRIPE_PARTIAL_REFUND_CONFIRMED", "Stripe confirmed initial partial refund", "system", null, { amountCents: partial.amountCents });
+        if (state === "succeeded") {
+          try {
+            await notifyCustomerPartialRefundOnce(partial.orderId, `initial-stripe:${partial.orderId}`, partial.amountCents, "Stripe");
+          } catch (error) { console.error("Stripe partial refund email requires review:", error); }
+        }
+        return res.json({ received: true });
+      }
+      const tracked = db.prepare(
+        "SELECT * FROM stripe_cancellation_refunds WHERE stripeRefundId = ?"
+      ).get(incoming.id);
+      if (!tracked) return res.json({ received: true });
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(tracked.orderId);
+      if (!order || order.status !== "CANCELLED" ||
+          Number(tracked.amountCents) !== Number(incoming.amount) ||
+          String(tracked.stripePaymentIntentId || "") !== String(incoming.payment_intent || "")) {
+        console.error("Stripe refund webhook mismatch; manual review required", incoming.id);
+        return res.status(409).json({ error: "Refund/order mismatch" });
+      }
+      const newStatus = String(incoming.status || "").toLowerCase();
+      if (!["pending", "requires_action", "succeeded", "failed", "canceled"].includes(newStatus)) {
+        console.warn("Unrecognized Stripe refund status:", newStatus);
+        return res.json({ received: true });
+      }
+      // Webhooks can arrive out of order. Never downgrade a confirmed refund.
+      const updated = db.transaction(() => {
+        const latest = db.prepare(
+          "SELECT refundStatus FROM stripe_cancellation_refunds WHERE orderId = ?"
+        ).get(tracked.orderId);
+        if (String(latest?.refundStatus || "").toLowerCase() === "succeeded") return false;
+        db.prepare(`
+          UPDATE stripe_cancellation_refunds
+          SET refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?
+        `).run(newStatus, tracked.orderId);
+        if (newStatus === "succeeded") {
+          return !!db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUNDED'
+            WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
+          `).run(tracked.orderId).changes;
+        }
+        return false;
+      })();
+      if (updated) {
+        logOrderEvent(tracked.orderId, "STRIPE_REFUND_CONFIRMED", "Stripe confirmed refund succeeded", "system", null);
+        await notifyCustomerRefundConfirmedOnce(tracked.orderId);
+      }
+      return res.json({ received: true });
+    }
     if (event.type === "checkout.session.completed" && event.data.object?.metadata?.quoteOrderId) {
       const session = event.data.object;
       if (session.payment_status !== "paid") return res.json({ received: true });
@@ -54,6 +169,18 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
           .get(meta.quoteOrderId, meta.quoteId);
         if (!order || order.stripeSessionId !== session.id) {
           throw new Error("Quote payment session does not match its order");
+        }
+        if (String(order.status || "").toUpperCase() === "CANCELLED") {
+          if (Math.round(Number(order.grandTotal) * 100) !== session.amount_total ||
+              String(session.currency).toLowerCase() !== "usd") {
+            throw new Error("Cancelled quote checkout total mismatch");
+          }
+          db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUND_PENDING'
+            WHERE id = ? AND status = 'CANCELLED'
+              AND paymentStatus IN ('PENDING', 'CANCELLED', 'PAYMENT_VERIFICATION_PENDING')
+          `).run(order.id);
+          return { orderId: order.id, cancelledPayment: true };
         }
         if (order.paymentStatus === "PAID") {
           if (!order.inventoryDeductedAt) deductInventoryOnceForPaidOrder(db, order.id);
@@ -66,10 +193,15 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
             String(session.currency).toLowerCase() !== "usd") {
           throw new Error("Quote checkout total mismatch");
         }
-        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card' WHERE id = ?").run(order.id);
+        db.prepare("UPDATE orders SET paymentStatus = 'PAID', status = 'PAID', paymentMethod = 'Card', stripePaymentIntentId = COALESCE(stripePaymentIntentId, ?) WHERE id = ?").run(typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id || null, order.id);
         deductInventoryOnceForPaidOrder(db, order.id);
         return { orderId: order.id, alreadyPaid: false };
       })();
+      if (saved.cancelledPayment) {
+        logOrderEvent(saved.orderId, "CANCELLED_PAYMENT_CONFIRMED", "Stripe payment arrived after quote cancellation; refund required", "system", null);
+        console.warn("Stripe payment received for cancelled quote order; refund pending:", saved.orderId);
+        return res.json({ received: true });
+      }
       if (!saved.alreadyPaid) {
         const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(saved.orderId);
         try {
@@ -162,15 +294,23 @@ const fullProducts = await Promise.all(
     );
   })
 );
-  const cleanItems = li.map((x, idx) => {
+  const serverPriced = meta.checkoutPricing === "server-v1";
+  const fees = new Map();
+  const cleanItems = li.flatMap((x, idx) => {
   const name = String(x?.description || `Item ${idx + 1}`);
   const qty = Number(x?.quantity);
   const unitCents = Number(x?.price?.unit_amount || 0);
   const price = Number((unitCents / 100).toFixed(2));
 
-  const sku = String(
-    fullProducts[idx]?.metadata?.sku || ""
-  ).trim();
+  const productMetadata = fullProducts[idx]?.metadata;
+  if (serverPriced && productMetadata?.checkoutFee) {
+    const fee = productMetadata.checkoutFee;
+    if (!["Shipping", "Sales tax"].includes(fee) || fees.has(fee) || qty !== 1 ||
+        !Number.isSafeInteger(unitCents) || unitCents <= 0) throw new Error("Invalid checkout fee");
+    fees.set(fee, unitCents);
+    return [];
+  }
+  const sku = String(productMetadata?.sku || "").trim();
 
   if (!sku) {
     throw new Error(`Missing SKU for ${name}`);
@@ -180,7 +320,7 @@ const fullProducts = await Promise.all(
     throw new Error(`Invalid quantity for SKU ${sku}`);
   }
 
-  return {
+  return [{
     id: `stripe_${idx + 1}`,
     name,
     sku,
@@ -189,7 +329,7 @@ const fullProducts = await Promise.all(
     price,
     qty,
     weightLb: 1,
-  };
+  }];
 });
 
   // 3) Totales y shipping usando tu misma lógica
@@ -206,13 +346,19 @@ const fullProducts = await Promise.all(
     return res.json({ received: true });
   }
 
-  const shippingNum = Math.max(0, Number(chosen.amount || 0));
-  const taxNum = calcTax(subtotal, customer);
+  const shippingNum = serverPriced ? (fees.get("Shipping") || 0) / 100 : Math.max(0, Number(chosen.amount || 0));
+  const taxNum = serverPriced ? (fees.get("Sales tax") || 0) / 100 : calcTax(subtotal, customer);
   const discounts = 0;
   const grandTotal = Number((subtotal + taxNum + shippingNum - discounts).toFixed(2));
 
+  if (serverPriced && (!cleanItems.length || session.currency !== "usd" ||
+      session.amount_total !== Math.round(grandTotal * 100))) {
+    throw new Error("Stripe Checkout total mismatch");
+  }
+
   // 4) Crear orden PAID/Card
       const saveWebhookOrder = db.transaction(() => {
+  if (db.prepare("SELECT id FROM orders WHERE stripeSessionId = ?").get(session.id)) return null;
   const orderId = uid("ord");
   const invoiceId = makeInvoiceId();
   const seq = nextOrderSeq();
@@ -242,7 +388,7 @@ const fullProducts = await Promise.all(
     "Card",
     "PAID",
     subtotal,
-    0,
+    taxNum,
     discounts,
     subtotal,
     taxNum,
@@ -262,11 +408,16 @@ JSON.stringify(cleanItems),
 "PAID",
 session.id
 );
+  db.prepare("UPDATE orders SET stripePaymentIntentId = ? WHERE id = ?").run(
+    typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id || null,
+    orderId
+  );
   deductInventoryOnceForPaidOrder(db, orderId);
   return orderId;
 });
 
 const orderId = saveWebhookOrder();
+if (!orderId) return res.json({ received: true });
 const createdOrder = db.prepare("SELECT orderNumber, invoiceId FROM orders WHERE id = ?").get(orderId);
 console.log("✅ Order created:", createdOrder.orderNumber, createdOrder.invoiceId);
   console.log("🚀 Starting email block...");
@@ -354,7 +505,7 @@ await sendEmail({
 });
 
 app.use((req, res, next) => {
-  console.log("REQ:", req.method, req.url);
+  console.log("REQ:", req.method, req.path);
   next();
 });
 app.use("/uploads", express.static("uploads"));
@@ -362,7 +513,7 @@ app.use("/invoices", express.static("invoices")); // ✅ ESTA ES LA CLAVE
 app.use(cors()); // permite llamadas desde cualquier localhost (dev)
 app.use(express.json({ limit: "6mb" })); 
 app.use(express.urlencoded({ extended: true }));
-app.use(stripeRoutes);
+
 
 
 // =====================================================
@@ -590,6 +741,99 @@ function logOrderEvent(orderId, type, message, actorType = "system", actorId = n
     console.error("logOrderEvent error:", err);
   }
 }
+async function notifyCustomerCancellationStatus(order) {
+  const customer = db.prepare("SELECT email FROM customers WHERE id = ?").get(order.customerId);
+  if (!customer?.email) return false;
+  const payment = String(order.paymentStatus || "").toUpperCase();
+  const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(order.id);
+  if (settlement) {
+    const money = cents => (Number(cents) / 100).toFixed(2);
+    const number = String(order.orderNumber || order.id);
+    const initialConfirmed = settlement.status === "INITIAL_REFUND_CONFIRMED";
+    const detail = initialConfirmed
+      ? "The initial partial refund has been confirmed."
+      : "The initial partial refund is pending and has not yet been confirmed.";
+    const shippoDetail = "If Shippo later returns the label charge to us, we will review that amount for an additional refund. The $5.00 processing fee is not refundable.";
+    await sendEmail({
+      to: customer.email,
+      subject: `Order cancelled - ${number} | DDA Auto Parts`,
+      text: `Your order ${number} has been cancelled before carrier pickup. ${detail}\n\nOrder payment: ${money(settlement.amountPaidCents)}\nShipping label cost: ${money(settlement.labelCostCents)}\nNon-refundable processing fee: ${money(settlement.processingFeeCents)}\nInitial partial refund: ${money(settlement.initialRefundCents)}\n\n${shippoDetail}`
+    });
+    return true;
+  }
+  const detail = payment === "REFUNDED"
+    ? "Your refund has been confirmed by the payment processor."
+    : payment === "REFUND_PENDING"
+      ? "Your refund is being processed. We will notify you when confirmed."
+      : payment === "PAYMENT_VERIFICATION_PENDING"
+        ? "We are verifying whether payment was received. Any confirmed payment will be reviewed for a full refund."
+        : "No refund is required unless a payment is subsequently confirmed.";
+  const number = String(order.orderNumber || order.id);
+  await sendEmail({
+    to: customer.email,
+    subject: `Order cancelled - ${number} | DDA Auto Parts`,
+    text: `Your order ${number} has been cancelled. ${detail}`
+  });
+  return true;
+}
+// One delivery attempt per refund. An uncertain email outcome is left for
+// manual review rather than risking duplicate customer notifications.
+// A separate notification key for each confirmed partial refund.
+// Unknown delivery results are not retried automatically.
+async function notifyCustomerPartialRefundOnce(orderId, notificationKey, amountCents, source) {
+  if (!Number.isSafeInteger(amountCents) || amountCents <= 0 ||
+      !["Zelle", "Stripe"].includes(source)) return false;
+  const order = db.prepare(`SELECT o.id, o.orderNumber, o.status, o.paymentStatus, c.email AS customerEmail
+    FROM orders o LEFT JOIN customers c ON c.id = o.customerId WHERE o.id = ?`).get(orderId);
+  if (!order || order.status !== "CANCELLED" ||
+      order.paymentStatus !== "PARTIALLY_REFUNDED" || !order.customerEmail) return false;
+  const key = String(notificationKey || "");
+  if (!key || key.length > 180) return false;
+  const claimed = db.prepare(`INSERT OR IGNORE INTO partial_refund_notification_attempts
+    (notificationKey, orderId) VALUES (?, ?)`).run(key, orderId);
+  if (!claimed.changes) return false;
+  try {
+    await sendEmail({
+      to: order.customerEmail,
+      subject: `Partial refund confirmed - ${order.orderNumber || order.id} | DDA Auto Parts`,
+      text: `A partial refund of ${(amountCents / 100).toFixed(2)} for cancelled order ${order.orderNumber || order.id} has been ${source === "Zelle" ? "recorded as sent through Zelle" : "confirmed by Stripe"}. The $5.00 cancellation processing fee is non-refundable. Any additional Shippo label refund will be handled separately.`
+    });
+    db.prepare("UPDATE partial_refund_notification_attempts SET status = 'SENT' WHERE notificationKey = ?").run(key);
+    return true;
+  } catch (error) {
+    db.prepare("UPDATE partial_refund_notification_attempts SET status = 'REVIEW_REQUIRED' WHERE notificationKey = ?").run(key);
+    console.error("Partial refund email requires review:", key, error);
+    return false;
+  }
+}
+async function notifyCustomerRefundConfirmedOnce(orderId) {
+  const order = db.prepare(`
+    SELECT o.*, c.email AS customerEmail FROM orders o
+    LEFT JOIN customers c ON c.id = o.customerId WHERE o.id = ?
+  `).get(orderId);
+  if (!order || String(order.status).toUpperCase() !== "CANCELLED" ||
+      String(order.paymentStatus).toUpperCase() !== "REFUNDED" || !order.customerEmail) return false;
+  const claimed = db.prepare(`
+    INSERT OR IGNORE INTO refund_confirmation_emails (orderId, status)
+    VALUES (?, 'SENDING')
+  `).run(orderId);
+  if (!claimed.changes) return false;
+  try {
+    await sendEmail({
+      to: order.customerEmail,
+      subject: `Refund confirmed - ${order.orderNumber || order.id} | DDA Auto Parts`,
+      text: String(order.paymentMethod || "").toLowerCase() === "zelle"
+        ? `DDA Auto Parts has recorded the Zelle refund for cancelled order ${order.orderNumber || order.id} as sent. Please check your receiving account.`
+        : `Your refund for cancelled order ${order.orderNumber || order.id} has been confirmed by the payment processor. Please allow your payment provider time to post the credit.`
+    });
+    db.prepare("UPDATE refund_confirmation_emails SET status = 'SENT' WHERE orderId = ?").run(orderId);
+    return true;
+  } catch (err) {
+    db.prepare("UPDATE refund_confirmation_emails SET status = 'REVIEW_REQUIRED' WHERE orderId = ?").run(orderId);
+    console.error("Refund confirmation email requires review:", orderId, err);
+    return false;
+  }
+}
 // ===== NOTIFY ADMIN (cancel request) =====
 async function notifyAdminCancelRequested(order) {
   console.log("NOTIFY ADMIN CANCEL REQUEST:", order);
@@ -748,6 +992,92 @@ db.exec(`
 `);
 // ===== INVENTORY: products table (SQLite) =====
 db.exec(`
+CREATE TABLE IF NOT EXISTS stripe_partial_cancellation_refunds (
+  orderId TEXT PRIMARY KEY,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING',
+  createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+  updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS stripe_shippo_additional_refunds (
+  orderId TEXT PRIMARY KEY,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING'
+);
+CREATE TABLE IF NOT EXISTS stripe_shippo_batch_refunds (
+  batchId INTEGER PRIMARY KEY,
+  orderId TEXT NOT NULL,
+  stripePaymentIntentId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  stripeRefundId TEXT UNIQUE,
+  refundStatus TEXT NOT NULL DEFAULT 'REQUESTING'
+);
+CREATE TABLE IF NOT EXISTS shippo_additional_refund_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  orderId TEXT NOT NULL,
+  amountCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT NOT NULL,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shippo_additional_refund_batches_order ON shippo_additional_refund_batches(orderId);
+CREATE TABLE IF NOT EXISTS shippo_additional_refunds (
+  orderId TEXT PRIMARY KEY,
+  amountCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS shippo_label_refund_verifications (
+  shippoTransactionId TEXT PRIMARY KEY,
+  orderId TEXT NOT NULL,
+  labelId TEXT NOT NULL,
+  verifiedAmountCents INTEGER NOT NULL,
+  evidenceReference TEXT NOT NULL,
+  verifiedBy TEXT NOT NULL,
+  verifiedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS label_cancellation_settlements (
+  orderId TEXT PRIMARY KEY,
+  paymentMethod TEXT NOT NULL,
+  amountPaidCents INTEGER NOT NULL,
+  labelCostCents INTEGER NOT NULL,
+  processingFeeCents INTEGER NOT NULL,
+  initialRefundCents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PREPARED',
+  createdBy TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS label_cancellation_reviews (
+  orderId TEXT PRIMARY KEY,
+  reviewStatus TEXT NOT NULL DEFAULT 'PENDING',
+  labelCostCents INTEGER NOT NULL,
+  processingFeeCents INTEGER NOT NULL DEFAULT 500,
+  totalFeeCents INTEGER NOT NULL,
+  labelSnapshotJson TEXT NOT NULL,
+  carrierNotPickedUpConfirmed INTEGER NOT NULL DEFAULT 0,
+  adminId TEXT,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+  updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS partial_refund_notification_attempts (
+  notificationKey TEXT PRIMARY KEY,
+  orderId TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'SENDING',
+  createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS refund_confirmation_emails (
+  orderId TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'SENDING'
+);
+CREATE TABLE IF NOT EXISTS inventory_cancellation_restorations (
+  orderId TEXT PRIMARY KEY,
+  restoredAt TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sku TEXT NOT NULL UNIQUE,
@@ -765,6 +1095,12 @@ CREATE TABLE IF NOT EXISTS products (
   updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `);
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN transferReference TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedBy TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refunds ADD COLUMN confirmedAt TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN transferReference TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN confirmedBy TEXT"); } catch {}
+try { db.exec("ALTER TABLE shippo_additional_refund_batches ADD COLUMN confirmedAt TEXT"); } catch {}
 // ===== PRODUCT COST COLUMN =====
 try {
   db.exec(`ALTER TABLE products ADD COLUMN cost_cents INTEGER NOT NULL DEFAULT 0;`);
@@ -829,6 +1165,34 @@ function reserveInventoryOrThrow(db, items) {
     decStock.run(qty, sku);
   }
 }
+// Restore reserved stock at most once; called inside the same transaction as cancellation.
+function restoreInventoryForCancelledOrder(db, orderId) {
+  const order = db.prepare("SELECT status, inventoryDeductedAt, itemsJson FROM orders WHERE id = ?").get(orderId);
+  if (!order || String(order.status || "").toUpperCase() !== "CANCELLED") {
+    throw new Error("Order must be cancelled before restoring inventory");
+  }
+  if (!order.inventoryDeductedAt) return false;
+  const claimed = db.prepare(
+    "INSERT OR IGNORE INTO inventory_cancellation_restorations (orderId) VALUES (?)"
+  ).run(orderId);
+  if (!claimed.changes) return false;
+  const items = JSON.parse(order.itemsJson || "[]");
+  if (!Array.isArray(items) || !items.length) throw new Error("Invalid cancelled order items");
+  const quantities = new Map();
+  for (const item of items) {
+    const sku = String(item.sku || "").trim();
+    const qty = Number(item.qty);
+    if (!sku || !Number.isSafeInteger(qty) || qty <= 0) throw new Error("Invalid cancelled order item");
+    const total = (quantities.get(sku) || 0) + qty;
+    if (!Number.isSafeInteger(total)) throw new Error("Invalid cancelled order quantity");
+    quantities.set(sku, total);
+  }
+  for (const [sku, qty] of quantities) {
+    const updated = db.prepare("UPDATE products SET stock = stock + ? WHERE sku = ?").run(qty, sku);
+    if (updated.changes !== 1) throw new Error("Cannot restore missing SKU: " + sku);
+  }
+  return true;
+}
 function deductInventoryOnceForPaidOrder(db, orderId) {
   return db.transaction(() => {
     const order = db.prepare(
@@ -836,6 +1200,12 @@ function deductInventoryOnceForPaidOrder(db, orderId) {
     ).get(orderId);
 
     if (!order) throw new Error("Order not found");
+
+    // Never allocate stock to an order cancelled while payment confirmation
+    // or another asynchronous fulfillment step was still in flight.
+    if (["CANCELLED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+      throw new Error("Cannot deduct inventory for a cancelled order");
+    }
 
     if (order.inventoryDeductedAt) {
       return false;
@@ -973,6 +1343,19 @@ db.exec(`
   WHERE stripePaymentIntentId IS NOT NULL
 `);
 
+// Track Stripe refund requests separately from order payment state.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stripe_cancellation_refunds (
+    orderId TEXT PRIMARY KEY,
+    stripeRefundId TEXT UNIQUE,
+    stripePaymentIntentId TEXT,
+    refundStatus TEXT NOT NULL DEFAULT 'NOT_REQUESTED',
+    amountCents INTEGER,
+    lastError TEXT,
+    updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
 // =====================================================
 // SAFE MIGRATIONS (adds missing columns if DB already existed)
 // =====================================================
@@ -1017,6 +1400,7 @@ try {
   oadd("confirmedAt", "TEXT", " DEFAULT ''");
   oadd("invoiceSentAt", "TEXT", " DEFAULT ''");
   oadd("invoiceSentTo", "TEXT", " DEFAULT ''");
+  oadd("zelleNotifiedAt", "TEXT");
 
   // ensure indexes exist
   db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_customerId ON orders(customerId);`);
@@ -1651,6 +2035,7 @@ app.get("/auth/me", authRequired, (req, res) => {
 // =====================================================
 // ADMIN: Customers list
 // =====================================================
+app.use(createStripeRouter({ stripe, db, authRequired, computeShippingOptionsAdvanced, calcTax }));
 app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
 app.use("/admin/shippo", createShippoRatesRouter(db, authRequired));
 // Delivery timestamp is nullable until verified from the carrier; never infer it from purchase date.
@@ -1706,6 +2091,7 @@ app.get("/admin/orders", authRequired, (req, res) => {
     o.status,
     o.paymentStatus,
     o.paymentMethod,
+    EXISTS(SELECT 1 FROM shipping_labels sl WHERE sl.orderId = o.id) AS shippingLabelCreated,
     o.createdAt
   FROM orders o
   LEFT JOIN customers c ON c.id = o.customerId
@@ -1818,20 +2204,45 @@ totalProfit += subtotal - totalCost;
     res.status(500).json({ error: "Failed to load dashboard" });
   }
 });
-app.put("/admin/orders/:id/cancel", authRequired, (req, res) => {
+app.put("/admin/orders/:id/cancel", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
       return res.status(403).json({ error: "Forbidden" });
     }
 
     const { id } = req.params;
-
-    const result = db.prepare(`
-      UPDATE orders
-      SET status = 'CANCELLED',
-          paymentStatus = 'CANCELLED'
-      WHERE id = ?
-    `).run(id);
+    const order = db.prepare("SELECT id, status, paymentStatus FROM orders WHERE id = ?").get(id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(order.status || "").toUpperCase())) {
+      return res.status(409).json({ error: "This order requires shipping-aware cancellation review" });
+    }
+    const labelPurchase = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id);
+    if (labelPurchase) return res.status(409).json({ error: "Shipping label exists or purchase is in progress; manual shipping review required" });
+    const result = db.transaction(() => {
+      const current = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      if (!current || ["CANCELLED", "SHIPPED", "DELIVERED", "LABEL_CREATED"].includes(String(current.status || "").toUpperCase())) {
+        return { changes: 0 };
+      }
+      // Recheck the label reservation inside the cancellation transaction.
+      if (db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id)) {
+        return { changes: 0 };
+      }
+      const updated = db.prepare(`
+        UPDATE orders
+        SET status = 'CANCELLED',
+            paymentStatus = CASE
+              WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING'
+              WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING'
+              WHEN paymentStatus = 'PENDING' AND (stripeSessionId IS NOT NULL OR stripePaymentIntentId IS NOT NULL)
+                THEN 'PAYMENT_VERIFICATION_PENDING'
+              ELSE 'CANCELLED'
+            END
+        WHERE id = ? AND status NOT IN ('CANCELLED', 'SHIPPED', 'DELIVERED', 'LABEL_CREATED')
+      `).run(id);
+      if (updated.changes) restoreInventoryForCancelledOrder(db, id);
+      return updated;
+    })();
+    if (!result.changes) return res.status(409).json({ error: "Order is not eligible for direct cancellation" });
 
     console.log("CANCEL ORDER ID:", id);
     console.log("CANCEL CHANGES:", result.changes);
@@ -1842,10 +2253,790 @@ logOrderEvent(
   "admin",
   req.user?.id ? String(req.user.id) : null
 );
-    return res.json({ ok: true, changes: result.changes });
+    const cancelled = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+    let refund = null;
+    if (String(cancelled?.paymentStatus || "").toUpperCase() === "REFUND_PENDING" &&
+        String(cancelled?.paymentMethod || "").toLowerCase() !== "zelle") {
+      refund = await submitCancelledStripeRefund(cancelled, "admin", req.user?.id ? String(req.user.id) : null);
+      if (!refund.ok) console.warn("Admin cancellation requires Stripe refund review:", id);
+    }
+    try {
+      await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(id));
+    } catch (emailError) {
+      console.error("Admin cancellation customer email failed:", emailError);
+    }
+    return res.json({ ok: true, changes: result.changes, refund });
   } catch (e) {
     console.error("❌ /admin/orders/:id/cancel error:", e);
     return res.status(500).json({ error: "Failed to cancel order" });
+  }
+});
+// Read-only preview. Never approve cancellation or charge a fee based on this alone.
+app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const order = db.prepare("SELECT id, status, grandTotal FROM orders WHERE id = ?").get(String(req.params.id || ""));
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (["SHIPPED", "DELIVERED", "CANCELLED"].includes(String(order.status || "").toUpperCase())) return res.status(409).json({ error: "Shipped, delivered, or cancelled orders cannot enter this review" });
+  const labels = db.prepare(
+    "SELECT id, amount, currency, refundStatus, shippoTransactionId FROM shipping_labels WHERE orderId = ?"
+  ).all(order.id);
+  if (!labels.length) return res.status(409).json({ error: "No purchased label found; use the no-label cancellation workflow" });
+  // Never calculate a customer fee when a label's purchase amount or currency is uncertain.
+  const cents = labels.map(label => {
+    const amount = String(label.amount ?? "").trim();
+    if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
+        String(label.currency || "").toUpperCase() !== "USD" ||
+        !label.shippoTransactionId) return null;
+    const value = Math.round(Number(amount) * 100);
+    return Number.isSafeInteger(value) ? value : null;
+  });
+  if (cents.some(value => value === null)) {
+    return res.status(409).json({ error: "Label cost not verified; manual shipping review required" });
+  }
+  const labelCostCents = cents.reduce((sum, value) => sum + value, 0);
+  if (!Number.isSafeInteger(labelCostCents) || labelCostCents > Number.MAX_SAFE_INTEGER - 500) return res.status(409).json({ error: "Invalid total label cost" });
+  const processingFeeCents = 500;
+  return res.json({
+    orderId: order.id, orderStatus: order.status,
+    labelCount: labels.length, labelCostCents, processingFeeCents,
+    potentialCancellationFeeCents: labelCostCents + processingFeeCents,
+    labelRefundStatuses: labels.map(label => label.refundStatus || "UNKNOWN"),
+    requiresAdminApproval: true,
+    shippingConfirmationRequired: true,
+    approvalEnabled: false,
+    notice: "Estimate only. Verify carrier pickup and Shippo label refund before approving or charging."
+  });
+});
+// Record a shipping-aware cancellation review without changing order/payment status.
+// Actual cancellation, fees and Shippo refunds require a separate approved workflow.
+app.post("/admin/orders/:id/label-cancellation-review", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
+    const id = String(req.params.id || "");
+    if (req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Explicit confirmation that carrier has not picked up the parcel is required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT id, status FROM orders WHERE id = ?").get(id);
+      if (!order) return { error: "Order not found", code: 404 };
+      if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+        return { error: "Order is not eligible for label cancellation review", code: 409 };
+      }
+      const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+      if (!labels.length) return { error: "No purchased shipping label", code: 409 };
+      let total = 0;
+      for (const label of labels) {
+        const amount = String(label.amount ?? "").trim();
+        if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
+            String(label.currency || "").toUpperCase() !== "USD" || !label.shippoTransactionId ||
+            label.shippoTransactionId.startsWith("pending-") || ["PURCHASING", "PURCHASE_REVIEW"].includes(label.refundStatus)) {
+          return { error: "Unverified shipping label amount", code: 409 };
+        }
+        const cents = Math.round(Number(amount) * 100);
+        if (!Number.isSafeInteger(cents) || !Number.isSafeInteger(total + cents + 500)) {
+          return { error: "Invalid shipping label amount", code: 409 };
+        }
+        total += cents;
+      }
+      const existing = db.prepare("SELECT orderId FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (existing) return { error: "Cancellation review already exists; inspect it before proceeding", code: 409 };
+      db.prepare(`INSERT INTO label_cancellation_reviews
+        (orderId, reviewStatus, labelCostCents, processingFeeCents, totalFeeCents,
+         labelSnapshotJson, carrierNotPickedUpConfirmed, adminId)
+        VALUES (?, 'PENDING', ?, 500, ?, ?, 1, ?)`
+      ).run(id, total, total + 500, JSON.stringify(labels), String(req.user?.id || ""));
+      return { ok: true, orderId: id, reviewStatus: "PENDING", labelCostCents: total, processingFeeCents: 500, totalFeeCents: total + 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_REVIEW_CREATED", "Admin recorded pre-pickup cancellation review; no cancellation or refund executed", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Label cancellation review error:", error);
+    return res.status(500).json({ error: "Could not record cancellation review" });
+  }
+});
+// Approve/reject the review record only. No order cancellation or money movement.
+app.put("/admin/orders/:id/label-cancellation-review/decision", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const decision = String(req.body?.decision || "").toUpperCase();
+    if (!["APPROVED", "REJECTED"].includes(decision)) {
+      return res.status(400).json({ error: "decision must be APPROVED or REJECTED" });
+    }
+    if (req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm carrier has not picked up the parcel" });
+    }
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      if (!order) return { error: "Order not found", code: 404 };
+      if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+        return { error: "Order status requires shipping review", code: 409 };
+      }
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (!review || review.reviewStatus !== "PENDING" || review.carrierNotPickedUpConfirmed !== 1) {
+        return { error: "No eligible pending review", code: 409 };
+      }
+      const currentLabels = db.prepare(
+        "SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id"
+      ).all(id);
+      if (JSON.stringify(currentLabels) !== review.labelSnapshotJson) {
+        return { error: "Shipping labels changed; manual review required", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE label_cancellation_reviews
+        SET reviewStatus = ?, adminId = ?, updatedAt = datetime('now')
+        WHERE orderId = ? AND reviewStatus = 'PENDING'`
+      ).run(decision, String(req.user?.id || ""), id);
+      if (!changed.changes) return { error: "Review already decided", code: 409 };
+      return { ok: true, orderId: id, reviewStatus: decision,
+        labelCostCents: review.labelCostCents,
+        processingFeeCents: review.processingFeeCents,
+        potentialCancellationFeeCents: review.totalFeeCents,
+        orderCancelled: false, refundInitiated: false };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_REVIEW_" + decision,
+      "Admin decided label cancellation review; order and payment unchanged",
+      "admin", String(req.user?.id || ""));
+    return res.json(outcome);
+  } catch (error) {
+    console.error("Label cancellation decision error:", error);
+    return res.status(500).json({ error: "Failed to decide label cancellation review" });
+  }
+});
+// Financial preview for an approved review; does not change the order or issue refunds.
+app.get("/admin/orders/:id/label-cancellation-settlement", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id || "");
+    const order = db.prepare("SELECT id, status, paymentStatus, grandTotal, paymentMethod FROM orders WHERE id = ?").get(id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+    if (!review || review.reviewStatus !== "APPROVED") {
+      return res.status(409).json({ error: "Approved label cancellation review required" });
+    }
+    if (!["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase())) {
+      return res.status(409).json({ error: "Order requires shipping status review" });
+    }
+    const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+    if (JSON.stringify(labels) !== review.labelSnapshotJson) {
+      return res.status(409).json({ error: "Label information changed; review again before settlement" });
+    }
+    if (String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+      return res.status(409).json({ error: "Payment must be verified before calculating a refund" });
+    }
+    const total = Number(order.grandTotal);
+    const amountCents = Math.round(total * 100);
+    if (!Number.isFinite(total) || !Number.isSafeInteger(amountCents) || amountCents < 0 ||
+        !Number.isSafeInteger(review.totalFeeCents) || review.totalFeeCents < 500) {
+      return res.status(409).json({ error: "Invalid payment or cancellation amount" });
+    }
+    if (amountCents < review.totalFeeCents) {
+      return res.status(409).json({ error: "Cancellation fees exceed amount paid; manual review required" });
+    }
+    return res.json({
+      orderId: id, paymentMethod: order.paymentMethod,
+      amountPaidCents: amountCents,
+      labelCostCents: review.labelCostCents,
+      processingFeeCents: 500,
+      initialRefundCents: amountCents - review.totalFeeCents,
+      additionalRefundIfShippoRefundsAllLabelsCents: review.labelCostCents,
+      totalRefundIfShippoRefundsAllLabelsCents: amountCents - 500,
+      requiresManualSettlement: true,
+      refundSubmitted: false,
+      orderCancelled: false
+    });
+  } catch (error) {
+    console.error("Label cancellation settlement preview error:", error);
+    return res.status(500).json({ error: "Unable to calculate settlement" });
+  }
+});
+// Persist a unique settlement plan. No order mutation or payment transfer.
+app.post("/admin/orders/:id/label-cancellation-settlement/prepare", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "confirmPrepare must be true" });
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT id, status, paymentStatus, paymentMethod, grandTotal FROM orders WHERE id = ?").get(id);
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      if (!order || !review || review.reviewStatus !== "APPROVED" ||
+          !["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase()) ||
+          String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+        return { error: "Order/payment/review not eligible", code: 409 };
+      }
+      const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+      if (!labels.length || JSON.stringify(labels) !== review.labelSnapshotJson) {
+        return { error: "Shipping label data changed", code: 409 };
+      }
+      const paid = Math.round(Number(order.grandTotal) * 100);
+      const fee = Number(review.totalFeeCents);
+      if (!Number.isSafeInteger(paid) || !Number.isSafeInteger(fee) || paid < fee ||
+          fee !== Number(review.labelCostCents) + 500) {
+        return { error: "Invalid settlement amounts", code: 409 };
+      }
+      const method = String(order.paymentMethod || "").toLowerCase();
+      if (method !== "zelle" && method !== "stripe" && method !== "card") {
+        return { error: "Payment method needs manual review", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO label_cancellation_settlements
+        (orderId, paymentMethod, amountPaidCents, labelCostCents, processingFeeCents, initialRefundCents, createdBy)
+        VALUES (?, ?, ?, ?, 500, ?, ?)`
+      ).run(id, method, paid, review.labelCostCents, paid - fee, String(req.user?.id || ""));
+      if (!inserted.changes) return { error: "Settlement already prepared; review existing record", code: 409 };
+      return { ok: true, orderId: id, status: "PREPARED", paymentMethod: method,
+        initialRefundCents: paid - fee, labelCostCents: review.labelCostCents,
+        processingFeeCents: 500, orderCancelled: false, refundSubmitted: false };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_SETTLEMENT_PREPARED",
+      "Admin prepared label cancellation settlement; no payment or cancellation executed",
+      "admin", String(req.user?.id || ""));
+    return res.status(201).json(outcome);
+  } catch (error) {
+    console.error("Prepare label settlement error:", error);
+    return res.status(500).json({ error: "Could not prepare settlement" });
+  }
+});
+// Explicitly cancel a prepared, approved pre-pickup order.
+// Financial settlement remains separately pending; never call the full-refund helper.
+app.post("/admin/orders/:id/label-cancellation-settlement/cancel-order", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmCancellation !== true || req.body?.carrierNotPickedUpConfirmed !== true) {
+      return res.status(400).json({ error: "Explicit cancellation and no-pickup confirmations required" });
+    }
+    const pickup = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? AND UPPER(COALESCE(carrierTrackingStatus,'')) IN ('TRANSIT','OUT_FOR_DELIVERY','DELIVERED','RETURNED','FAILURE') LIMIT 1").get(String(req.params.id || ""));
+    if (pickup) return res.status(409).json({ error: "At least one package was picked up; whole-order cancellation requires manual partial-shipment review" });
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const review = db.prepare("SELECT * FROM label_cancellation_reviews WHERE orderId = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !review || !settlement ||
+          review.reviewStatus !== "APPROVED" || settlement.status !== "PREPARED" ||
+          !["LABEL_CREATED", "CANCEL_REQUESTED"].includes(String(order.status || "").toUpperCase()) ||
+          String(order.paymentStatus || "").toUpperCase() !== "PAID") {
+        return { error: "Cancellation review, payment or settlement not eligible", code: 409 };
+      }
+      const labels = db.prepare(
+        "SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id"
+      ).all(id);
+      if (!labels.length || JSON.stringify(labels) !== review.labelSnapshotJson ||
+          settlement.labelCostCents !== review.labelCostCents ||
+          settlement.initialRefundCents !== settlement.amountPaidCents - review.totalFeeCents) {
+        return { error: "Shipping or financial records changed", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE orders SET status = 'CANCELLED', paymentStatus = 'REFUND_PENDING'
+        WHERE id = ? AND paymentStatus = 'PAID' AND status IN ('LABEL_CREATED', 'CANCEL_REQUESTED')`).run(id);
+      if (!changed.changes) return { error: "Order status changed", code: 409 };
+      restoreInventoryForCancelledOrder(db, id);
+      db.prepare("UPDATE label_cancellation_settlements SET status = 'CANCELLED_REFUND_PENDING' WHERE orderId = ? AND status = 'PREPARED'").run(id);
+      return { ok: true, orderId: id, orderCancelled: true, refundSubmitted: false,
+        initialRefundCents: settlement.initialRefundCents, paymentMethod: settlement.paymentMethod };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "LABEL_CANCELLATION_ORDER_CANCELLED", "Order cancelled; partial refund awaiting execution", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(id)); }
+    catch (error) { console.error("Label cancellation email failed:", error); }
+    return res.json(result);
+  } catch (error) {
+    console.error("Label cancellation failed:", error);
+    return res.status(500).json({ error: "Failed to cancel label order" });
+  }
+});
+// Manual Zelle partial refund: ADMIN confirms transfer already sent.
+// Never send money automatically or use the full-refund endpoint.
+app.post("/admin/orders/:id/label-cancellation-settlement/confirm-zelle-refund", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm the exact partial Zelle refund was actually sent" });
+    }
+    const id = String(req.params.id || "");
+    const outcome = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !settlement || settlement.status !== "CANCELLED_REFUND_PENDING" ||
+          String(order.status || "").toUpperCase() !== "CANCELLED" ||
+          String(order.paymentStatus || "").toUpperCase() !== "REFUND_PENDING" ||
+          String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle") {
+        return { error: "No eligible pending Zelle partial refund", code: 409 };
+      }
+      if (Number(req.body?.amountCents) !== settlement.initialRefundCents ||
+          !Number.isSafeInteger(settlement.initialRefundCents) || settlement.initialRefundCents < 0) {
+        return { error: "Confirmed Zelle transfer amount must match the settlement exactly", code: 409 };
+      }
+      db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ?").run(id);
+      db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(id);
+      return { ok: true, orderId: id, status: "INITIAL_REFUND_CONFIRMED",
+        amountCents: settlement.initialRefundCents, paymentStatus: "PARTIALLY_REFUNDED" };
+    })();
+    if (outcome.error) return res.status(outcome.code).json({ error: outcome.error });
+    logOrderEvent(id, "ZELLE_PARTIAL_REFUND_CONFIRMED",
+      "Admin confirmed partial Zelle refund sent", "admin", String(req.user?.id || ""),
+      { amountCents: outcome.amountCents });
+    try { await notifyCustomerPartialRefundOnce(id, `initial-zelle:${id}`, outcome.amountCents, "Zelle"); }
+    catch (error) { console.error("Initial Zelle partial refund email requires review:", error); }
+    return res.json(outcome);
+  } catch (error) {
+    console.error("Confirm partial Zelle refund error:", error);
+    return res.status(500).json({ error: "Unable to confirm partial Zelle refund" });
+  }
+});
+// Stripe partial refund: claim once before the external call; uncertain outcomes require reconciliation.
+app.post("/admin/orders/:id/label-cancellation-settlement/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit refund confirmation required" });
+    const id = String(req.params.id || "");
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const plan = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || !plan || order.status !== "CANCELLED" || order.paymentStatus !== "REFUND_PENDING" ||
+          plan.status !== "CANCELLED_REFUND_PENDING" || !["stripe", "card"].includes(plan.paymentMethod)) {
+        return { error: "No eligible Stripe partial refund", code: 409 };
+      }
+      const amount = plan.initialRefundCents;
+      const paymentIntentId = String(order.stripePaymentIntentId || "");
+      if (!/^pi_[a-zA-Z0-9]+$/.test(paymentIntentId) ||
+          !Number.isSafeInteger(amount) || amount <= 0 ||
+          amount > plan.amountPaidCents || amount !== plan.amountPaidCents - plan.labelCostCents - 500) {
+        return { error: "Invalid payment intent or partial refund amount", code: 409 };
+      }
+      if (db.prepare("SELECT orderId FROM stripe_cancellation_refunds WHERE orderId = ?").get(id)) {
+        return { error: "Full refund workflow already exists; manual review required", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO stripe_partial_cancellation_refunds
+        (orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?)`).run(id, paymentIntentId, amount);
+      if (!inserted.changes) return { error: "Refund already requested or under review", code: 409 };
+      return { orderId: id, paymentIntentId, amountCents: amount };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, kind: "label_cancellation_initial_partial" }
+      }, { idempotencyKey: `dda-label-partial-${id}` });
+      db.prepare(`UPDATE stripe_partial_cancellation_refunds
+        SET stripeRefundId = ?, refundStatus = ?, updatedAt = datetime('now') WHERE orderId = ?`
+      ).run(refund.id, String(refund.status || "pending").toLowerCase(), id);
+      // Reconcile immediately in case Stripe's webhook arrived before persistence.
+      const verified = await stripe.refunds.retrieve(refund.id);
+      if (verified.id === refund.id && verified.status === "succeeded" &&
+          Number(verified.amount) === claim.amountCents &&
+          String(verified.payment_intent || "") === claim.paymentIntentId) {
+        db.transaction(() => {
+          db.prepare("UPDATE stripe_partial_cancellation_refunds SET refundStatus = 'succeeded', updatedAt = datetime('now') WHERE orderId = ?").run(id);
+          db.prepare("UPDATE label_cancellation_settlements SET status = 'INITIAL_REFUND_CONFIRMED' WHERE orderId = ? AND status = 'CANCELLED_REFUND_PENDING'").run(id);
+          db.prepare("UPDATE orders SET paymentStatus = 'PARTIALLY_REFUNDED' WHERE id = ? AND paymentStatus = 'REFUND_PENDING'").run(id);
+        })();
+        try { await notifyCustomerPartialRefundOnce(id, `initial-stripe:${id}`, claim.amountCents, "Stripe"); }
+        catch (error) { console.error("Immediate Stripe partial refund email requires review:", error); }
+      }
+      return res.json({ ok: true, refundId: refund.id, amountCents: claim.amountCents,
+        status: verified.status, requiresConfirmation: verified.status !== "succeeded" });
+    } catch (error) {
+      db.prepare(`UPDATE stripe_partial_cancellation_refunds SET refundStatus = 'REVIEW_REQUIRED',
+        updatedAt = datetime('now') WHERE orderId = ? AND refundStatus != 'succeeded'`).run(id);
+      console.error("Stripe partial refund requires reconciliation:", id, error);
+      return res.status(202).json({ ok: false, reviewRequired: true,
+        message: "Stripe result uncertain; reconcile before any retry" });
+    }
+  } catch (error) {
+    console.error("Partial refund endpoint error:", error);
+    return res.status(500).json({ error: "Unable to process partial refund" });
+  }
+});
+// Read-only Shippo refund reconciliation: a label refund is not customer money yet.
+app.get("/admin/orders/:id/shippo-refund-reconciliation", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    const id = String(req.params.id || "");
+    const order = db.prepare("SELECT id, status, paymentStatus FROM orders WHERE id = ?").get(id);
+    const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+    if (!order || !settlement || order.status !== "CANCELLED") {
+      return res.status(409).json({ error: "Cancelled label settlement required" });
+    }
+    const labels = db.prepare("SELECT id, shippoTransactionId, amount, currency, refundStatus FROM shipping_labels WHERE orderId = ? ORDER BY id").all(id);
+    if (!labels.length) return res.status(409).json({ error: "No labels found" });
+    let confirmedCents = 0;
+    const details = [];
+    for (const label of labels) {
+      const amount = String(label.amount ?? "").trim();
+      if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
+          String(label.currency || "").toUpperCase() !== "USD") {
+        return res.status(409).json({ error: "Invalid label amount; manual review required" });
+      }
+      const cents = Math.round(Number(amount) * 100);
+      if (!Number.isSafeInteger(cents)) return res.status(409).json({ error: "Invalid label amount" });
+      const state = String(label.refundStatus || "").toUpperCase();
+      // Local status alone is NOT proof Shippo has returned the money.
+      details.push({ labelId: label.id, transactionId: label.shippoTransactionId,
+        labelCostCents: cents, shippoRefundStatus: state || "UNKNOWN",
+        verificationRequired: true });
+    }
+    return res.json({
+      orderId: id, settlementStatus: settlement.status,
+      processingFeeRetainedCents: 500,
+      labelCostCents: settlement.labelCostCents,
+      shippoRefundsVerifiedCents: confirmedCents,
+      additionalCustomerRefundAuthorizedCents: 0,
+      labels: details,
+      requiresShippoFinancialVerification: true,
+      notice: "Verify Shippo refund settlement independently before authorizing any additional customer refund. No funds moved."
+    });
+  } catch (error) {
+    console.error("Shippo refund reconciliation error:", error);
+    return res.status(500).json({ error: "Could not reconcile Shippo label refunds" });
+  }
+});
+// Record documentary evidence of an actual Shippo refund, without sending customer funds.
+app.post("/admin/orders/:id/shippo-refund-verification", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.fundsReceivedConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm Shippo refund funds were actually received" });
+    }
+    const id = String(req.params.id || "");
+    const transactionId = String(req.body?.shippoTransactionId || "").trim();
+    const evidence = String(req.body?.evidenceReference || "").trim();
+    const amountCents = Number(req.body?.verifiedAmountCents);
+    if (!transactionId || !evidence || evidence.length > 500 ||
+        !Number.isSafeInteger(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ error: "Valid transaction, positive amount and evidence required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || !settlement ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED") {
+        return { error: "Initial refund must be confirmed before recording Shippo funds", code: 409 };
+      }
+      const label = db.prepare("SELECT id, amount, currency FROM shipping_labels WHERE orderId = ? AND shippoTransactionId = ?").get(id, transactionId);
+      if (!label || String(label.currency).toUpperCase() !== "USD" ||
+          !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(String(label.amount))) {
+        return { error: "Label amount or currency invalid", code: 409 };
+      }
+      const labelCents = Math.round(Number(label.amount) * 100);
+      if (amountCents > labelCents) return { error: "Verified refund exceeds label cost", code: 409 };
+      const prior = db.prepare("SELECT shippoTransactionId FROM shippo_label_refund_verifications WHERE shippoTransactionId = ?").get(transactionId);
+      if (prior) return { error: "Shippo transaction already verified", code: 409 };
+      const sum = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      if (sum + amountCents > settlement.labelCostCents) return { error: "Verified funds exceed settlement label costs", code: 409 };
+      db.prepare(`INSERT INTO shippo_label_refund_verifications
+        (shippoTransactionId, orderId, labelId, verifiedAmountCents, evidenceReference, verifiedBy)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(transactionId, id, label.id, amountCents, evidence, String(req.user?.id || "admin"));
+      return { ok: true, orderId: id, shippoTransactionId: transactionId,
+        verifiedAmountCents: amountCents, totalVerifiedCents: sum + amountCents,
+        additionalCustomerRefundSubmitted: false };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_REFUND_FUNDS_VERIFIED", "Admin recorded received Shippo funds with evidence", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Shippo refund verification failed:", error);
+    return res.status(500).json({ error: "Unable to verify Shippo refund" });
+  }
+});
+// Additional Shippo refund ledger: reserve exact verified funds for one customer payout.
+// This endpoint never moves money and never returns the retained $5 processing fee.
+app.post("/admin/orders/:id/shippo-additional-refund/prepare", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "Explicit preparation confirmation required" });
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || !settlement ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED") {
+        return { error: "Initial customer refund must be confirmed first", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents),0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const existing = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (existing) return { error: "Additional refund already prepared; reconcile existing record", code: 409 };
+      if (!Number.isSafeInteger(verified) || verified <= 0 || verified > settlement.labelCostCents ||
+          settlement.initialRefundCents + verified > settlement.amountPaidCents - 500) {
+        return { error: "Verified Shippo amount exceeds refundable balance", code: 409 };
+      }
+      db.prepare(`INSERT INTO shippo_additional_refunds (orderId, amountCents, status, createdBy)
+        VALUES (?, ?, 'PREPARED', ?)`).run(id, verified, String(req.user?.id || ""));
+      return { ok: true, orderId: id, amountCents: verified, status: "PREPARED",
+        retainedProcessingFeeCents: 500, fundsSent: false };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_REFUND_PREPARED", "Verified Shippo funds reserved for customer refund; not sent", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Additional Shippo refund preparation error:", error);
+    return res.status(500).json({ error: "Unable to prepare additional refund" });
+  }
+});
+// Confirm an additional Zelle refund already transferred to the customer.
+app.post("/admin/orders/:id/shippo-additional-refund/confirm-zelle", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm Zelle transfer was sent" });
+    const id = String(req.params.id || "");
+    const evidence = String(req.body?.transferReference || "").trim();
+    if (!evidence || evidence.length > 500) return res.status(400).json({ error: "Transfer reference required" });
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const extra = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (!order || !settlement || !extra || order.status !== "CANCELLED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED" || String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle" || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          extra.status !== "PREPARED") {
+        return { error: "No eligible prepared Zelle additional refund", code: 409 };
+      }
+      if (!Number.isSafeInteger(extra.amountCents) || extra.amountCents <= 0 ||
+          Number(req.body?.amountCents) !== extra.amountCents ||
+          settlement.initialRefundCents + extra.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Transfer amount does not match verified refundable balance", code: 409 };
+      }
+      const changed = db.prepare(`UPDATE shippo_additional_refunds
+        SET status = 'CONFIRMED', transferReference = ?, confirmedBy = ?,
+            confirmedAt = datetime('now') WHERE orderId = ? AND status = 'PREPARED'`
+      ).run(evidence, String(req.user?.id || ""), id);
+      if (!changed.changes) return { error: "Already confirmed", code: 409 };
+      return { ok: true, orderId: id, amountCents: extra.amountCents,
+        status: "CONFIRMED", processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_ZELLE_REFUND_CONFIRMED",
+      "Admin confirmed additional Zelle transfer with reference", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerPartialRefundOnce(id, `shippo-zelle-first:${id}`, result.amountCents, "Zelle"); }
+    catch (error) { console.error("First Shippo Zelle email requires review:", error); }
+    return res.json(result);
+  } catch (error) {
+    console.error("Additional Zelle refund confirmation error:", error);
+    return res.status(500).json({ error: "Unable to confirm additional Zelle refund" });
+  }
+});
+// Additional Stripe refund for verified Shippo money, independent from initial refund.
+app.post("/admin/orders/:id/shippo-additional-refund/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit confirmation required" });
+    const id = String(req.params.id || "");
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const extra = db.prepare("SELECT * FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      const initial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(id);
+      if (!order || !settlement || !extra || !initial ||
+          order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" || extra.status !== "PREPARED" ||
+          initial.refundStatus !== "succeeded" || !["stripe", "card"].includes(settlement.paymentMethod)) {
+        return { error: "Initial Stripe refund or additional settlement not confirmed", code: 409 };
+      }
+      const amount = extra.amountCents;
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      if (!Number.isSafeInteger(amount) || amount <= 0 || amount > verified ||
+          initial.amountCents + amount > settlement.amountPaidCents - 500 ||
+          String(order.stripePaymentIntentId || "") !== initial.stripePaymentIntentId) {
+        return { error: "Refund amount or Stripe payment intent mismatch", code: 409 };
+      }
+      const inserted = db.prepare(`INSERT OR IGNORE INTO stripe_shippo_additional_refunds
+        (orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?)`).run(id, initial.stripePaymentIntentId, amount);
+      if (!inserted.changes) return { error: "Additional Stripe refund already requested", code: 409 };
+      db.prepare("UPDATE shippo_additional_refunds SET status = 'STRIPE_REQUESTED' WHERE orderId = ? AND status = 'PREPARED'").run(id);
+      return { paymentIntentId: initial.stripePaymentIntentId, amountCents: amount };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, kind: "shippo_additional_refund" }
+      }, { idempotencyKey: `dda-shippo-additional-${id}` });
+      db.prepare("UPDATE stripe_shippo_additional_refunds SET stripeRefundId = ?, refundStatus = ? WHERE orderId = ?")
+        .run(refund.id, String(refund.status || "pending").toLowerCase(), id);
+      try {
+        const verified = await stripe.refunds.retrieve(refund.id);
+        if (verified.id === refund.id && verified.status === "succeeded" &&
+            Number(verified.amount) === claim.amountCents &&
+            String(verified.payment_intent || "") === claim.paymentIntentId) {
+          db.transaction(() => {
+            db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = 'succeeded' WHERE orderId = ?").run(id);
+            db.prepare("UPDATE shippo_additional_refunds SET status = 'CONFIRMED' WHERE orderId = ? AND status = 'STRIPE_REQUESTED'").run(id);
+          })();
+        }
+      } catch (verifyError) { console.warn("Additional Stripe refund verification pending", id, verifyError.message); }
+      return res.json({ ok: true, refundId: refund.id, amountCents: claim.amountCents,
+        confirmationPending: db.prepare("SELECT refundStatus FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(id).refundStatus !== "succeeded" });
+    } catch (error) {
+      db.prepare("UPDATE stripe_shippo_additional_refunds SET refundStatus = 'REVIEW_REQUIRED' WHERE orderId = ? AND refundStatus != 'succeeded'").run(id);
+      console.error("Additional Stripe refund needs manual reconciliation:", id, error);
+      return res.status(202).json({ ok: false, reviewRequired: true, message: "Reconcile Stripe before retrying" });
+    }
+  } catch (error) {
+    console.error("Additional Stripe refund failed:", error);
+    return res.status(500).json({ error: "Unable to process additional refund" });
+  }
+});
+// Reserve a later Shippo receipt batch without moving money. Existing first-batch flow stays unchanged.
+app.post("/admin/orders/:id/shippo-additional-refund/prepare-next-batch", authRequired, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmPrepare !== true) return res.status(400).json({ error: "Explicit confirmation required" });
+    const id = String(req.params.id || "");
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT amountCents, status FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      if (!order || order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          !settlement || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          !first || first.status !== "CONFIRMED") {
+        return { error: "First additional refund must be confirmed before another batch", code: 409 };
+      }
+      const pending = db.prepare("SELECT id FROM shippo_additional_refund_batches WHERE orderId = ? AND status != 'CONFIRMED' LIMIT 1").get(id);
+      if (pending) return { error: "Existing batch requires completion or review", code: 409 };
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const prior = db.prepare("SELECT COALESCE(SUM(amountCents), 0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ?").get(id).cents;
+      const available = verified - first.amountCents - prior;
+      if (!Number.isSafeInteger(available) || available <= 0 ||
+          settlement.initialRefundCents + first.amountCents + prior + available > settlement.amountPaidCents - 500) {
+        return { error: "No new verified Shippo funds available", code: 409 };
+      }
+      const inserted = db.prepare("INSERT INTO shippo_additional_refund_batches (orderId, amountCents, createdBy) VALUES (?, ?, ?)").run(id, available, String(req.user?.id || "admin"));
+      return { ok: true, batchId: inserted.lastInsertRowid, orderId: id, amountCents: available,
+        status: "PREPARED", fundsSent: false, processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ADDITIONAL_BATCH_PREPARED", "Later verified Shippo refund reserved; no transfer made", "admin", String(req.user?.id || ""));
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Shippo next batch preparation failed:", error);
+    return res.status(500).json({ error: "Unable to prepare later Shippo refund batch" });
+  }
+});
+// Confirm a later Shippo-funded Zelle batch only after the transfer has been sent.
+app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/confirm-zelle", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.refundSentConfirmed !== true) return res.status(400).json({ error: "Confirm transfer was actually sent" });
+    const id = String(req.params.id || "");
+    const batchId = Number(req.params.batchId);
+    const reference = String(req.body?.transferReference || "").trim();
+    if (!Number.isSafeInteger(batchId) || batchId <= 0 || !reference || reference.length > 500) {
+      return res.status(400).json({ error: "Valid batch and transfer reference required" });
+    }
+    const result = db.transaction(() => {
+      const order = db.prepare("SELECT status, paymentStatus, paymentMethod FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT amountCents, status FROM shippo_additional_refunds WHERE orderId = ?").get(id);
+      const batch = db.prepare("SELECT * FROM shippo_additional_refund_batches WHERE id = ? AND orderId = ?").get(batchId, id);
+      if (!order || !settlement || !first || !batch || order.status !== "CANCELLED" ||
+          order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          String(order.paymentMethod || "").toLowerCase() !== "zelle" ||
+          settlement.paymentMethod !== "zelle" || settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          first.status !== "CONFIRMED" || batch.status !== "PREPARED") {
+        return { error: "Batch not eligible for Zelle confirmation", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents), 0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const otherBatches = db.prepare("SELECT COALESCE(SUM(amountCents), 0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ? AND id != ?").get(id, batchId).cents;
+      if (!Number.isSafeInteger(batch.amountCents) || batch.amountCents <= 0 ||
+          Number(req.body?.amountCents) !== batch.amountCents ||
+          first.amountCents + otherBatches + batch.amountCents > verified ||
+          settlement.initialRefundCents + first.amountCents + otherBatches + batch.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Transfer amount exceeds verified refundable funds", code: 409 };
+      }
+      const updated = db.prepare(`UPDATE shippo_additional_refund_batches
+        SET status = 'CONFIRMED', transferReference = ?, confirmedBy = ?,
+            confirmedAt = datetime('now') WHERE id = ? AND orderId = ? AND status = 'PREPARED'`
+      ).run(reference, String(req.user?.id || "admin"), batchId, id);
+      if (!updated.changes) return { error: "Batch already processed", code: 409 };
+      return { ok: true, orderId: id, batchId, amountCents: batch.amountCents,
+        status: "CONFIRMED", processingFeeRetainedCents: 500 };
+    })();
+    if (result.error) return res.status(result.code).json({ error: result.error });
+    logOrderEvent(id, "SHIPPO_ZELLE_BATCH_CONFIRMED", "Admin confirmed later Zelle transfer", "admin", String(req.user?.id || ""));
+    try { await notifyCustomerPartialRefundOnce(id, `shippo-zelle-batch:${result.batchId}`, result.amountCents, "Zelle"); }
+    catch (error) { console.error("Shippo Zelle batch email requires review:", error); }
+    return res.json(result);
+  } catch (error) {
+    console.error("Shippo Zelle batch confirmation failed:", error);
+    return res.status(500).json({ error: "Unable to confirm Zelle batch" });
+  }
+});
+// Execute one later Shippo batch refund through Stripe; each batch has its own idempotency key.
+app.post("/admin/orders/:id/shippo-additional-refund/batches/:batchId/refund-stripe", authRequired, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+    if (req.body?.confirmRefund !== true) return res.status(400).json({ error: "Explicit refund confirmation required" });
+    const id = String(req.params.id || "");
+    const batchId = Number(req.params.batchId);
+    if (!Number.isSafeInteger(batchId) || batchId <= 0) return res.status(400).json({ error: "Invalid batch" });
+    const claim = db.transaction(() => {
+      const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+      const settlement = db.prepare("SELECT * FROM label_cancellation_settlements WHERE orderId = ?").get(id);
+      const initial = db.prepare("SELECT * FROM stripe_partial_cancellation_refunds WHERE orderId = ?").get(id);
+      const first = db.prepare("SELECT * FROM stripe_shippo_additional_refunds WHERE orderId = ?").get(id);
+      const batch = db.prepare("SELECT * FROM shippo_additional_refund_batches WHERE id = ? AND orderId = ?").get(batchId, id);
+      if (!order || !settlement || !initial || !first || !batch ||
+          order.status !== "CANCELLED" || order.paymentStatus !== "PARTIALLY_REFUNDED" ||
+          !["stripe", "card"].includes(settlement.paymentMethod) ||
+          settlement.status !== "INITIAL_REFUND_CONFIRMED" ||
+          initial.refundStatus !== "succeeded" || first.refundStatus !== "succeeded" ||
+          batch.status !== "PREPARED" ||
+          String(order.stripePaymentIntentId || "") !== initial.stripePaymentIntentId ||
+          first.stripePaymentIntentId !== initial.stripePaymentIntentId) {
+        return { error: "Stripe batch prerequisites not met", code: 409 };
+      }
+      const verified = db.prepare("SELECT COALESCE(SUM(verifiedAmountCents),0) AS cents FROM shippo_label_refund_verifications WHERE orderId = ?").get(id).cents;
+      const firstRefund = db.prepare("SELECT amountCents FROM shippo_additional_refunds WHERE orderId = ? AND status = 'CONFIRMED'").get(id);
+      const other = db.prepare("SELECT COALESCE(SUM(amountCents),0) AS cents FROM shippo_additional_refund_batches WHERE orderId = ? AND id != ?").get(id, batchId).cents;
+      if (!firstRefund || !Number.isSafeInteger(batch.amountCents) || batch.amountCents <= 0 ||
+          firstRefund.amountCents + other + batch.amountCents > verified ||
+          initial.amountCents + firstRefund.amountCents + other + batch.amountCents > settlement.amountPaidCents - 500) {
+        return { error: "Batch exceeds verified refundable funds", code: 409 };
+      }
+      const claimed = db.prepare(`INSERT OR IGNORE INTO stripe_shippo_batch_refunds
+        (batchId, orderId, stripePaymentIntentId, amountCents) VALUES (?, ?, ?, ?)`
+      ).run(batchId, id, initial.stripePaymentIntentId, batch.amountCents);
+      if (!claimed.changes) return { error: "Stripe refund already attempted for this batch", code: 409 };
+      db.prepare("UPDATE shippo_additional_refund_batches SET status = 'STRIPE_REQUESTED' WHERE id = ? AND status = 'PREPARED'").run(batchId);
+      return { paymentIntentId: initial.stripePaymentIntentId, amountCents: batch.amountCents };
+    })();
+    if (claim.error) return res.status(claim.code).json({ error: claim.error });
+    try {
+      const refund = await stripe.refunds.create({
+        payment_intent: claim.paymentIntentId, amount: claim.amountCents,
+        metadata: { orderId: id, batchId: String(batchId), kind: "shippo_additional_batch" }
+      }, { idempotencyKey: `dda-shippo-batch-${batchId}` });
+      db.prepare("UPDATE stripe_shippo_batch_refunds SET stripeRefundId = ?, refundStatus = ? WHERE batchId = ?")
+        .run(refund.id, String(refund.status || "pending").toLowerCase(), batchId);
+      try {
+        const verified = await stripe.refunds.retrieve(refund.id);
+        if (verified.id === refund.id && verified.status === "succeeded" &&
+            Number(verified.amount) === claim.amountCents &&
+            String(verified.payment_intent || "") === claim.paymentIntentId) {
+          db.transaction(() => {
+            db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = 'succeeded' WHERE batchId = ?").run(batchId);
+            db.prepare("UPDATE shippo_additional_refund_batches SET status = 'CONFIRMED' WHERE id = ? AND status = 'STRIPE_REQUESTED'").run(batchId);
+          })();
+        }
+      } catch (verifyError) { console.warn("Shippo batch Stripe verification pending", batchId, verifyError.message); }
+      return res.json({ ok: true, batchId, refundId: refund.id, amountCents: claim.amountCents,
+        confirmationPending: db.prepare("SELECT refundStatus FROM stripe_shippo_batch_refunds WHERE batchId = ?").get(batchId).refundStatus !== "succeeded" });
+    } catch (error) {
+      db.prepare("UPDATE stripe_shippo_batch_refunds SET refundStatus = 'REVIEW_REQUIRED' WHERE batchId = ? AND refundStatus != 'succeeded'").run(batchId);
+      console.error("Stripe batch refund reconciliation required", batchId, error);
+      return res.status(202).json({ ok: false, reviewRequired: true, message: "Reconcile Stripe before retrying" });
+    }
+  } catch (error) {
+    console.error("Stripe batch refund endpoint error", error);
+    return res.status(500).json({ error: "Unable to process Stripe batch" });
   }
 });
 app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
@@ -1868,11 +3059,14 @@ app.put("/admin/orders/:id/approve-cancel", authRequired, async (req, res) => {
     if (String(row.status || "").toUpperCase() !== "CANCEL_REQUESTED") {
       return res.status(400).json({ error: "Order is not waiting for cancel approval" });
     }
-
+    const labelPurchase = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(id);
+    if (labelPurchase) return res.status(409).json({ error: "Shipping label exists or purchase is in progress; shipping review required" });
+    // Stop fulfillment immediately; refunds are handled after cancellation.
     const result = db.prepare(`
   UPDATE orders
-  SET status = 'CANCELLED'
-  WHERE id = ?
+  SET status = 'CANCELLED',
+      paymentStatus = CASE WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING' ELSE paymentStatus END
+  WHERE id = ? AND status = 'CANCEL_REQUESTED'
 `).run(id);
 logOrderEvent(
   id,
@@ -1973,6 +3167,86 @@ return res.json({ ok: true, changes: result.changes, status: newStatus, updated 
     return res.status(500).json({ error: "Failed to reject cancellation" });
   }
 });
+async function submitCancelledStripeRefund(order, actorType = "system", actorId = null) {
+  const id = order.id;
+  // Label cancellations have their own partial-refund workflow.
+  // Never initiate a full Stripe refund for an order with a label settlement.
+  if (db.prepare("SELECT orderId FROM label_cancellation_settlements WHERE orderId = ?").get(id)) {
+    return { ok: false, partialSettlementRequired: true,
+      error: "Label cancellation requires its dedicated partial refund workflow" };
+  }
+  const claim = db.prepare(`
+    INSERT OR IGNORE INTO stripe_cancellation_refunds (orderId, refundStatus)
+    VALUES (?, 'REQUESTING')
+  `).run(id);
+  if (!claim.changes) {
+    const previous = db.prepare("SELECT * FROM stripe_cancellation_refunds WHERE orderId = ?").get(id);
+    return { ok: false, alreadyRequested: true, refund: previous };
+  }
+  try {
+    const result = await requestFullStripeRefund({ stripe, order });
+    db.prepare(`
+      UPDATE stripe_cancellation_refunds
+      SET stripeRefundId = ?, stripePaymentIntentId = ?, refundStatus = ?, amountCents = ?,
+          updatedAt = datetime('now')
+      WHERE orderId = ?
+    `).run(result.refundId, result.paymentIntentId, result.status, result.amount, id);
+    logOrderEvent(id, "STRIPE_REFUND_REQUESTED", "Stripe refund submitted; confirmation pending", actorType, actorId);
+    // Stripe can deliver refund.updated before the refund ID is persisted.
+    // Reconcile directly after saving, and accept only a verified succeeded status.
+    try {
+      const verified = await stripe.refunds.retrieve(result.refundId);
+      if (verified.id === result.refundId &&
+          verified.status === "succeeded" &&
+          verified.amount === result.amount &&
+          String(verified.payment_intent || "") === result.paymentIntentId) {
+        db.transaction(() => {
+          db.prepare(`
+            UPDATE stripe_cancellation_refunds
+            SET refundStatus = 'succeeded', updatedAt = datetime('now')
+            WHERE orderId = ? AND stripeRefundId = ?
+          `).run(id, result.refundId);
+          db.prepare(`
+            UPDATE orders SET paymentStatus = 'REFUNDED'
+            WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
+          `).run(id);
+        })();
+        logOrderEvent(id, "STRIPE_REFUND_CONFIRMED", "Stripe refund succeeded (verified by API)", "system", null);
+        await notifyCustomerRefundConfirmedOnce(id);
+      }
+    } catch (verificationError) {
+      // The refund request was already submitted: never issue a second refund.
+      console.warn("Stripe refund verification pending:", id, verificationError.message);
+    }
+    const current = db.prepare("SELECT paymentStatus FROM orders WHERE id = ?").get(id);
+    return { ok: true, refundId: result.refundId, stripeStatus: result.status,
+      paymentStatus: current?.paymentStatus || "REFUND_PENDING" };
+  } catch (error) {
+    // Do not automatically retry: Stripe may have processed the request.
+    db.prepare(`
+      UPDATE stripe_cancellation_refunds SET refundStatus = 'REVIEW_REQUIRED',
+          lastError = ?, updatedAt = datetime('now') WHERE orderId = ?
+    `).run(String(error.message || error).slice(0, 1000), id);
+    console.error("Stripe cancellation refund needs review:", id, error);
+    return { ok: false, reviewRequired: true };
+  }
+}
+// Admin-only controlled Stripe refund attempt. The order is already cancelled
+// before this route can be used. A unique row and Stripe idempotency key
+// prevent duplicate refund requests; uncertain network outcomes require review.
+app.post("/admin/orders/:id/request-stripe-refund", authRequired, async (req, res) => {
+  if (req.user?.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const id = String(req.params.id || "");
+  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+  if (!order) return res.status(404).json({ error: "Order not found" });
+  if (String(order.status).toUpperCase() !== "CANCELLED" ||
+      String(order.paymentStatus).toUpperCase() !== "REFUND_PENDING" ||
+      String(order.paymentMethod).toLowerCase() === "zelle") {
+    return res.status(409).json({ error: "Cancelled card order with refund pending required" });
+  }
+  const outcome = await submitCancelledStripeRefund(order, "admin", req.user?.id ? String(req.user.id) : null);
+  return res.status(outcome.ok ? 200 : 409).json(outcome);
+});
 app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
   try {
     if (req.user?.role !== "admin") {
@@ -1994,12 +3268,26 @@ app.put("/admin/orders/:id/refund", authRequired, async (req, res) => {
     if (String(row.paymentStatus || "").toUpperCase() === "REFUNDED") {
       return res.status(400).json({ error: "Already refunded" });
     }
+    if (db.prepare("SELECT orderId FROM label_cancellation_settlements WHERE orderId = ?").get(id)) {
+      return res.status(409).json({ error: "Label cancellation requires its dedicated partial Zelle refund confirmation" });
+    }
+    const refundOrder = db.prepare("SELECT status, paymentMethod FROM orders WHERE id = ?").get(id);
+    if (String(refundOrder?.status || "").toUpperCase() !== "CANCELLED" || String(row.paymentStatus || "").toUpperCase() !== "REFUND_PENDING") {
+      return res.status(409).json({ error: "Order must be cancelled with refund pending" });
+    }
+    if (String(refundOrder.paymentMethod || "").toLowerCase() !== "zelle") {
+      return res.status(409).json({ error: "Card refunds must be verified through Stripe; this action is for manual Zelle confirmation only" });
+    }
+    if (req.body?.refundSentConfirmed !== true) {
+      return res.status(400).json({ error: "Confirm the Zelle refund was actually sent before marking this order refunded", required: "refundSentConfirmed" });
+    }
 
     const result = db.prepare(`
       UPDATE orders
       SET paymentStatus = 'REFUNDED'
-      WHERE id = ?
+      WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'REFUND_PENDING'
     `).run(id);
+    if (!result.changes) return res.status(409).json({ error: "Refund state changed; refresh the order" });
 logOrderEvent(
   id,
   "ORDER_REFUNDED",
@@ -2019,11 +3307,9 @@ console.log("REFUND order for emails:", order);
     } catch (e) {
       console.error("Email notify admin refund error:", e);
     }
-try {
-  await notifyCustomerRefunded(order);
-} catch (e) {
-  console.error("Email notify customer refund error:", e);
-}
+// The shared notification claim prevents duplicate confirmation emails.
+    // This manual Zelle confirmation is recorded only after ADMIN attests payment was sent.
+    await notifyCustomerRefundConfirmedOnce(id);
     return res.json({ ok: true, changes: result.changes });
   } catch (e) {
     console.error("❌ refund error:", e);
@@ -2481,18 +3767,47 @@ app.put("/orders/:id/request-cancel", authRequired, async (req, res) => {
       return res.status(400).json({ error: "Cancellation request period has expired (30 days)." });
     }
 
-    const result = db.prepare(`
-      UPDATE orders
-      SET status = 'CANCEL_REQUESTED'
-      WHERE id = ? AND customerId = ?
-    `).run(orderId, customerId);
-logOrderEvent(
-  orderId,
-  "CANCEL_REQUESTED",
-  "Customer requested cancellation",
-  "customer",
-  req.user?.id ? String(req.user.id) : null
-);
+    // Decide under a single database transaction so label purchase reservations
+    // and cancellation cannot both be initiated in this database.
+    const decision = db.transaction(() => {
+      const current = db.prepare(
+        "SELECT status, paymentStatus FROM orders WHERE id = ? AND customerId = ?"
+      ).get(orderId, customerId);
+      if (!current || !["PENDING", "PAID"].includes(String(current.status || "").toUpperCase())) {
+        return { error: "Order is no longer eligible for cancellation" };
+      }
+      const label = db.prepare("SELECT id FROM shipping_labels WHERE orderId = ? LIMIT 1").get(orderId);
+      if (label) {
+        const result = db.prepare(
+          "UPDATE orders SET status = 'CANCEL_REQUESTED' WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')"
+        ).run(orderId, customerId);
+        return { result, status: "CANCEL_REQUESTED" };
+      }
+      const result = db.prepare(`
+        UPDATE orders
+        SET status = 'CANCELLED',
+            paymentStatus = CASE
+              WHEN paymentStatus = 'PAID' THEN 'REFUND_PENDING'
+              WHEN paymentStatus = 'PENDING_ADMIN' THEN 'PAYMENT_VERIFICATION_PENDING'
+              WHEN paymentStatus = 'PENDING' AND (stripeSessionId IS NOT NULL OR stripePaymentIntentId IS NOT NULL) THEN 'PAYMENT_VERIFICATION_PENDING'
+              ELSE 'CANCELLED'
+            END
+        WHERE id = ? AND customerId = ? AND status IN ('PENDING', 'PAID')
+      `).run(orderId, customerId);
+      if (result.changes) restoreInventoryForCancelledOrder(db, orderId);
+      return { result, status: "CANCELLED" };
+    })();
+    if (decision.error || !decision.result?.changes) {
+      return res.status(409).json({ error: decision.error || "Order state changed; retry cancellation" });
+    }
+    const result = decision.result;
+    logOrderEvent(
+      orderId,
+      decision.status === "CANCELLED" ? "ORDER_CANCELLED" : "CANCEL_REQUESTED",
+      decision.status === "CANCELLED" ? "Customer cancelled before label purchase; refund to follow if paid" : "Customer requested cancellation",
+      "customer",
+      req.user?.id ? String(req.user.id) : null
+    );
     const order = db.prepare(`
       SELECT o.*, c.email AS customerEmail
       FROM orders o
@@ -2506,10 +3821,29 @@ logOrderEvent(
       console.error("Email notify admin error:", e);
     }
 
+    // Automatically request a full refund only after cancellation is committed.
+    // Never retry a potentially submitted refund without reconciliation.
+    if (decision.status === "CANCELLED" &&
+        String(order.paymentStatus || "").toUpperCase() === "REFUND_PENDING" &&
+        String(order.paymentMethod || "").toLowerCase() !== "zelle") {
+      const refundOutcome = await submitCancelledStripeRefund(order);
+      if (!refundOutcome.ok) {
+        console.warn("Cancelled order requires Stripe refund review:", orderId);
+      }
+    }
+
+    if (decision.status === "CANCELLED") {
+      try {
+        await notifyCustomerCancellationStatus(db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId));
+      } catch (emailError) {
+        console.error("Customer cancellation email failed:", emailError);
+      }
+    }
+
     console.log("REQUEST CANCEL ORDER ID:", orderId);
     console.log("REQUEST CANCEL CHANGES:", result.changes);
 
-    return res.json({ ok: true, changes: result.changes });
+    return res.json({ ok: true, changes: result.changes, status: decision.status, refundPending: decision.status === "CANCELLED" && String(order.paymentStatus || "").toUpperCase() === "REFUND_PENDING" });
   } catch (e) {
     console.error("❌ /orders/:id/request-cancel error:", e);
     return res.status(500).json({ error: "Failed to request cancellation" });
@@ -2630,18 +3964,8 @@ app.post("/orders", authRequired, (req, res) => {
 
     const pm2 = String(paymentMethod || "zelle").toLowerCase();
 
-    let paymentStatus =
-      pm2 === "zelle" ? "PENDING_ADMIN" : "PENDING";
-
-    // ✅ Stripe ya cobrado desde frontend
-    if (
-      pm2 === "card" &&
-      String(req.body?.paymentStatusOverride || "") === "PAID"
-    ) {
-      paymentStatus = "PAID";
-    }
-
-    const orderStatus = paymentStatus === "PAID" ? "PAID" : "PENDING";
+    const paymentStatus = pm2 === "zelle" ? "PENDING_ADMIN" : "PENDING";
+    const orderStatus = "PENDING";
 
     const orderId = uid("ord");
     const invoiceId = makeInvoiceId();
@@ -3086,6 +4410,15 @@ app.post("/admin/orders/:id/confirm-zelle", authRequired, async (req, res) => {
 
     if (order.paymentStatus === "PAID") {
       return res.status(409).json({ ok: false, error: "Payment already confirmed" });
+    }
+    if (order.status === "CANCELLED" && order.paymentStatus === "PAYMENT_VERIFICATION_PENDING") {
+      const result = db.prepare(`
+        UPDATE orders SET paymentStatus = 'REFUND_PENDING', confirmedBy = ?, confirmedAt = ?
+        WHERE id = ? AND status = 'CANCELLED' AND paymentStatus = 'PAYMENT_VERIFICATION_PENDING'
+      `).run(String(req.user.email || ""), new Date().toISOString(), id);
+      if (!result.changes) return res.status(409).json({ ok: false, error: "Payment verification state changed" });
+      logOrderEvent(id, "CANCELLED_PAYMENT_CONFIRMED", "Zelle payment arrived after cancellation; manual refund required", "admin", req.user?.id ? String(req.user.id) : null);
+      return res.json({ ok: true, status: "CANCELLED", paymentStatus: "REFUND_PENDING", manualRefundRequired: true });
     }
     if (order.paymentStatus !== "PENDING_ADMIN" || order.status !== "PENDING") {
       return res.status(409).json({ ok: false, error: "Order is not awaiting Zelle confirmation" });

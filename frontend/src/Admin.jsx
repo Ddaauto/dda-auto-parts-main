@@ -6,13 +6,14 @@ import AdminShippingBoxes from "./AdminShippingBoxes";
 import AdminShippoRates from "./AdminShippoRates";
 import AdminShippingLabelDetails from "./AdminShippingLabelDetails";
 import AdminShippingOrigin from "./AdminShippingOrigin";
-const API_BASE = "https://dda-backend-ajr3.onrender.com";
+import AdminCancellationSettlement from "./AdminCancellationSettlement";
+const API_BASE = import.meta.env.VITE_API_URL || "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
 // VITE_ADMIN_USER=admin
 // VITE_ADMIN_PASS=1234
 const ADMIN_USER = import.meta.env.VITE_ADMIN_USER;
 const ADMIN_PASS = import.meta.env.VITE_ADMIN_PASS;
-const API = import.meta.env.VITE_API_URL;
+const API = API_BASE;
 
 const blankPick = { make: "", model: "", engine: "", yearStart: "", yearEnd: "" };
 const LOW_STOCK_THRESHOLD = 3;
@@ -710,19 +711,36 @@ async function loadQuotes() {
   }
 }
 
+async function previewLabelCancellation(id) {
+  try {
+    const token = localStorage.getItem("token");
+    const response = await fetch(`${API}/admin/orders/${id}/label-cancellation-preview`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Preview failed (HTTP ${response.status})`);
+    window.alert("Label cancellation preview (read-only):\n" + JSON.stringify(data, null, 2) +
+      "\n\nThis preview does NOT cancel the order or issue a refund.");
+  } catch (error) {
+    window.alert(error.message || "Could not preview label cancellation");
+  }
+}
 async function cancelOrder(id) {
   if (!window.confirm("Cancel this order?")) return;
 
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not cancel order");
@@ -734,13 +752,16 @@ async function approveCancelOrder(id) {
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/approve-cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/approve-cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not approve cancellation");
@@ -752,13 +773,16 @@ async function rejectCancelOrder(id) {
   try {
     const token = localStorage.getItem("token");
 
-    await fetch(`${API}/admin/orders/${id}/reject-cancel`, {
+    const response = await fetch(`${API}/admin/orders/${id}/reject-cancel`, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
-
+    if (!response.ok) {
+      const details = await response.json().catch(() => ({}));
+      throw new Error(details.error || `Cancellation action failed (HTTP ${response.status})`);
+    }
     await loadOrders();
   } catch (e) {
     alert(e.message || "Could not reject cancellation");
@@ -930,10 +954,11 @@ const getOrderCategory = o => {
   const payment = String(o.paymentStatus || "").toUpperCase();
   if (["CANCELLED", "CANCELED"].includes(status) || ["CANCELLED", "CANCELED", "REFUNDED"].includes(payment)) return "canceled";
   if (["SHIPPED", "DELIVERED"].includes(status)) return "shipped";
+  if (status === "LABEL_CREATED") return "label_created";
   if (["PAID", "CANCEL_REQUESTED"].includes(status) && payment === "PAID") return "unshipped";
   return "pending";
 };
-const orderCounts = ["pending", "unshipped", "canceled", "shipped"].reduce((counts, category) => {
+const orderCounts = ["pending", "unshipped", "label_created", "canceled", "shipped"].reduce((counts, category) => {
   counts[category] = (orders || []).filter(o => getOrderCategory(o) === category).length;
   return counts;
 }, {});
@@ -1356,7 +1381,7 @@ alert("CSV imported successfully");
 </div>
 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16, paddingBottom: 12, borderBottom: "1px solid #e2e8f0" }}>
   {[
-    ["pending", "Pending"], ["unshipped", "Unshipped"],
+    ["pending", "Pending"], ["unshipped", "Unshipped"], ["label_created", "Label Created"],
     ["canceled", "Canceled"], ["shipped", "Shipped"]
   ].map(([id, label]) => <button key={id} type="button" onClick={() => setOrderCategory(id)}
     className="btn" style={{ background: orderCategory === id ? "#1e3a5f" : "#f1f5f9", color: orderCategory === id ? "#fff" : "#334155", fontWeight: orderCategory === id ? 800 : 500 }}>
@@ -1407,11 +1432,11 @@ alert("CSV imported successfully");
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14, alignItems: "center" }}>
             <button className="btn" onClick={() => { setShippoOrderId(o.id); setAdminTab("shippoRates"); }} style={{ background: "#1e3a5f", color: "white" }}>Ship with Shippo</button>
-            {getOrderCategory(o) === "shipped" && <button className="btn" onClick={() => setExpandedShippingLabels(old => ({ ...old, [o.id]: !old[o.id] }))}>{expandedShippingLabels[o.id] ? "Hide label details" : "Shipping Label Details"}</button>}
+            {["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(o.status || "").toUpperCase()) && <button className="btn" onClick={() => setExpandedShippingLabels(old => ({ ...old, [o.id]: !old[o.id] }))}>{expandedShippingLabels[o.id] ? "Hide label details" : "Shipping Label Details"}</button>}
             <button className="btn" onClick={() => setExpandedOrderDetails(old => ({ ...old, [o.id]: !old[o.id] }))}>{detailsOpen ? "Hide details" : "View details"}</button>
             <button className="btn" onClick={() => toggleOrderHistory(o.id)}>{orderEventsOpen[o.id] ? "Hide history" : "History"}</button>
           </div>
-          {getOrderCategory(o) === "shipped" && expandedShippingLabels[o.id] && <div style={{ marginTop: 16, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
+          {["LABEL_CREATED", "SHIPPED", "DELIVERED"].includes(String(o.status || "").toUpperCase()) && expandedShippingLabels[o.id] && <div style={{ marginTop: 16, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
             <AdminShippingLabelDetails api={API_BASE} orderId={o.id} />
           </div>}
           {detailsOpen && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
@@ -1426,13 +1451,15 @@ alert("CSV imported successfully");
             </div>
             {items.length > 2 && <div style={{ marginTop: 14 }}>{items.slice(2).map((item, i) => <div key={i} style={{ padding: "5px 0" }}>{item.name || item.sku || "Product"} · Qty {item.qty || item.quantity || 1}</div>)}</div>}
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
-              {status === "CANCEL_REQUESTED" ? <>
+              {status === "LABEL_CREATED" && <button className="btn" type="button" onClick={() => previewLabelCancellation(o.id)}>Review cancellation fees (no changes)</button>}
+              {status === "CANCEL_REQUESTED" && !o.shippingLabelCreated ? <>
                 <button className="btn" onClick={() => approveCancelOrder(o.id)}>Approve cancellation</button>
                 <button className="btn" onClick={() => rejectCancelOrder(o.id)}>Reject cancellation</button>
-              </> : status !== "CANCELLED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
-              {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <button className="btn" onClick={() => markRefunded(o.id)}>Refund</button> : null}
+              </> : status !== "CANCELLED" && status !== "LABEL_CREATED" && status !== "CANCEL_REQUESTED" && status !== "SHIPPED" && status !== "DELIVERED" ? <button className="btn" onClick={() => cancelOrder(o.id)}>Cancel order</button> : null}
+              {String(o.paymentStatus || "").toUpperCase() === "REFUNDED" ? <span>Refunded</span> : status === "CANCELLED" ? <span>Refund: use verified settlement workflow when applicable</span> : null}
             </div>
           </div>}
+          {expandedOrderDetails[o.id] && ["LABEL_CREATED", "CANCEL_REQUESTED", "CANCELLED"].includes(status) && <AdminCancellationSettlement order={o} api={API} onChanged={loadOrders} />}
           {orderEventsOpen[o.id] && <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid #e2e8f0" }}>
             <strong>Order history</strong>
             {orderEventsLoading[o.id] ? <p>Loading history...</p> : !(orderEventsById[o.id] || []).length ? <p>No history available.</p> : (orderEventsById[o.id] || []).map(ev => <div key={ev.id} style={{ marginTop: 10, padding: 10, background: "#f8fafc", borderRadius: 8 }}>

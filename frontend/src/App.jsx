@@ -6,6 +6,7 @@ import logo from "./assets/logo.jpg";
 import Success from "./Success";
 import Cancel from "./NewCancel";
 import QuoteReview from "./QuoteReview";
+import CustomerPackageTracking from "./CustomerPackageTracking";
 /**
  * =========================
  * CONFIG
@@ -950,6 +951,7 @@ setTimeout(() => {
   </div>
 </div>
                   </div>
+                  <CustomerPackageTracking api={API} orderId={o.id} />
                 </div>
               ))}
             </div>
@@ -1568,38 +1570,18 @@ if (popup) {
 const pmCheckout = String(isLocal ? paymentMethod : "Card").toLowerCase();
 
 if (pmCheckout === "card") {
-  let email = me?.email || "";
-
-if (!email) {
-  try {
-    const fresh = await api("/auth/me");
-    setMe(fresh);
-    email = fresh?.user?.email || fresh?.customer?.email || "";
-
-  } catch {}
-}
-
-if (!email) {
-  alert("No pude obtener el email. Vuelve a login y prueba otra vez.");
-  return;
-}
-
   const r = await fetch(`${API}/stripe/create-checkout-session`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${getToken()}`,
     },
-   body: JSON.stringify({
-  items: itemsPayload,
-  selectedShippingId: shippingChoice,
-  vehicle: {
-    label: vehicleLabel,
-    vin: vinLoaded || "",
-  },
-  customerEmail: email,
-
-}),
-});
+    body: JSON.stringify({
+      items: itemsPayload,
+      selectedShippingId: shippingChoice,
+      vehicle: { label: vehicleLabel, vin: vinLoaded || "" },
+    }),
+  });
 
   const d = await r.json();
   if (!d?.url) {
