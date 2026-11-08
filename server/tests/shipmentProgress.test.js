@@ -50,7 +50,7 @@ test("returned and failed packages are not shipped", () => {
   }
 });
 test("invalid allocations are unverified even if carrier delivered", () => {
-  assert.equal(shipmentProgress(items, [label([{ key: "a", qty: 99 }], "DELIVERED")]).status, "LABEL_CREATED");
+  assert.equal(shipmentProgress(items, [label([{ key: "a", qty: 99 }], "DELIVERED")]).status, "UNVERIFIED");
   assert.equal(shipmentProgress(items, [{ packageItemsJson: "{broken", carrierTrackingStatus: "DELIVERED" }]).status, "UNVERIFIED");
 });
 test("zero quantity is invalid, not defaulted to one", () => {
