@@ -37,3 +37,22 @@ test("unknown products and negative quantities never complete", () => {
   assert.equal(shipmentProgress(items, [label([{ key: "unknown", qty: 3 }], "DELIVERED")]).complete, false);
   assert.equal(shipmentProgress(items, [label([{ key: "a", qty: -2 }], "DELIVERED")]).complete, false);
 });
+
+test("returned and failed packages are not shipped", () => {
+  for (const [carrierStatus, expected] of [["RETURNED", "RETURNED"], ["FAILURE", "DELIVERY_FAILURE"]]) {
+    const p = shipmentProgress(items, [
+      label([{ key: "a", qty: 2 }], carrierStatus),
+      label([{ key: "b", qty: 1 }], "DELIVERED")
+    ]);
+    assert.equal(p.complete, true);
+    assert.equal(p.status, expected);
+    assert.notEqual(p.status, "SHIPPED");
+  }
+});
+test("invalid allocations are unverified even if carrier delivered", () => {
+  assert.equal(shipmentProgress(items, [label([{ key: "a", qty: 99 }], "DELIVERED")]).status, "LABEL_CREATED");
+  assert.equal(shipmentProgress(items, [{ packageItemsJson: "{broken", carrierTrackingStatus: "DELIVERED" }]).status, "UNVERIFIED");
+});
+test("zero quantity is invalid, not defaulted to one", () => {
+  assert.equal(shipmentProgress([{ id: "a", qty: 0 }], []).status, "UNVERIFIED");
+});
