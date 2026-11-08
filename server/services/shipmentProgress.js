@@ -20,7 +20,9 @@ export function shipmentProgress(items, labels) {
       const key = String(part.key || "");
       const qty = Number(part.qty);
       if (!required.has(key) || !Number.isSafeInteger(qty) || qty < 1) { valid = false; break; }
-      allocated.set(key, (allocated.get(key) || 0) + qty);
+      const next = (allocated.get(key) || 0) + qty;
+      if (next > required.get(key)) { valid = false; break; }
+      allocated.set(key, next);
     }
     if (!valid) break;
   }
