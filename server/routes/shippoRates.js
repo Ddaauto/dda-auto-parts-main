@@ -38,7 +38,9 @@ export default function createShippoRatesRouter(db, authRequired) {
   )`);
   for (const ddl of [
     "ALTER TABLE shipping_labels ADD COLUMN packageItemsJson TEXT DEFAULT '[]'",
-    "ALTER TABLE shippo_rate_quotes ADD COLUMN packageItemsJson TEXT DEFAULT '[]'"
+    "ALTER TABLE shipping_labels ADD COLUMN testMode INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE shippo_rate_quotes ADD COLUMN packageItemsJson TEXT DEFAULT '[]'",
+    "ALTER TABLE shippo_rate_quotes ADD COLUMN testMode INTEGER NOT NULL DEFAULT 0"
   ]) { try { db.exec(ddl); } catch (e) { if (!String(e.message).includes("duplicate column name")) throw e; } }
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_shippo_one_inflight_purchase_per_order ON shipping_labels(orderId) WHERE refundStatus IN ('PURCHASING','PURCHASE_REVIEW')");
   const purchasedLabels = id => db.prepare("SELECT * FROM shipping_labels WHERE orderId = ? AND COALESCE(refundStatus,'') NOT IN ('SUCCESS','REFUNDED')").all(id);
@@ -106,7 +108,7 @@ export default function createShippoRatesRouter(db, authRequired) {
       },
       items: Array.isArray(items) ? items.map(item => ({
         id: item.id, name: item.name || item.title || item.sku || "Product",
-        sku: item.sku || "", qty: Number(item.qty || item.quantity || 1),
+        sku: item.sku || "", qty: Number(item.qty ?? item.quantity ?? 1),
       })) : [],
     };
   };
@@ -118,6 +120,8 @@ export default function createShippoRatesRouter(db, authRequired) {
   router.post("/rates", async (req, res) => {
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured on this server" });
+    const testMode = token.startsWith("shippo_test_");
+    const allowTestLabels = process.env.SHIPPO_ALLOW_TEST_LABELS === "true";
     const { box, orderId } = req.body || {};
     let destination = req.body?.destination;
     if (orderId) {
@@ -183,14 +187,14 @@ export default function createShippoRatesRouter(db, authRequired) {
       }
       if (orderId) {
         const save = db.prepare(`INSERT OR REPLACE INTO shippo_rate_quotes
-          (rateId, orderId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, expiresAt, packageItemsJson)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+          (rateId, orderId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, expiresAt, packageItemsJson, testMode)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
         db.transaction(() => {
           for (const rate of data.rates || []) {
-            if (!rate.object_id || rate.test === true) continue;
+            if (!rate.object_id || (testMode ? !allowTestLabels : rate.test === true)) continue;
             save.run(rate.object_id, String(orderId), String(rate.provider || ""), String(rate.servicelevel?.name || ""), String(rate.amount || ""), String(rate.currency || "USD"),
-              Number(box.lengthIn), Number(box.widthIn), Number(box.heightIn), Number(box.weightOz), expiresAt, JSON.stringify(req.packageAllocation || []));
+              Number(box.lengthIn), Number(box.widthIn), Number(box.heightIn), Number(box.weightOz), expiresAt, JSON.stringify(req.packageAllocation || []), Number(testMode));
           }
         })();
       }
@@ -211,7 +215,8 @@ export default function createShippoRatesRouter(db, authRequired) {
           estimatedDeliveryEnd: Number.isInteger(Number(rate.estimated_days)) && Number(rate.estimated_days) > 0
             ? addBusinessDays(shipDate, Number(rate.estimated_days) + 1) : null,
           durationTerms: rate.duration_terms || null,
-          test: rate.test === true,
+          test: testMode || rate.test === true,
+          purchasable: Boolean(orderId && rate.object_id && (testMode ? allowTestLabels : rate.test !== true)),
         })),
         messages: (data.messages || []).map(m => ({ text: m.text, source: m.source })),
         purchased: false,
@@ -245,6 +250,9 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (allocation.error) return res.status(409).json({ error: allocation.error });
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured" });
+    if (Boolean(quote.testMode) !== token.startsWith("shippo_test_") ||
+        (quote.testMode && process.env.SHIPPO_ALLOW_TEST_LABELS !== "true"))
+      return res.status(409).json({ error: "Shippo mode changed; request new rates" });
     // The selected rate must be allocated to an actual package, and its
     // quantities must still be available after previous labels.
     if (!allocation.items.length) return res.status(409).json({ error: "No items assigned to this package" });
@@ -252,10 +260,10 @@ export default function createShippoRatesRouter(db, authRequired) {
     const reservationId = "pending-" + rateId;
     try {
       db.prepare(`INSERT INTO shipping_labels
-        (id, orderId, shippoTransactionId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, purchasedAt, refundStatus, packageItemsJson)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PURCHASING', ?)`)
+        (id, orderId, shippoTransactionId, carrier, service, amount, currency, lengthIn, widthIn, heightIn, weightOz, purchasedAt, refundStatus, packageItemsJson, testMode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PURCHASING', ?, ?)`)
         .run(reservationId, orderId, reservationId, quote.carrier, quote.service, quote.amount, quote.currency,
-          quote.lengthIn, quote.widthIn, quote.heightIn, quote.weightOz, new Date().toISOString(), JSON.stringify(allocation.items));
+          quote.lengthIn, quote.widthIn, quote.heightIn, quote.weightOz, new Date().toISOString(), JSON.stringify(allocation.items), quote.testMode);
     } catch {
       return res.status(409).json({ error: "Label purchase is already in progress or exists; contact support before retrying" });
     }

@@ -62,8 +62,8 @@ export default function AdminShippoRates({ api, orderId = null }) {
   })).filter(item => item.qty > 0);
   const purchaseLabel = async rate => {
     if (!orderId || !selectedOrder || purchasing) return;
-    if (rate.test) { setError("Test rates cannot be purchased here."); return; }
-    const confirmed = window.confirm(`Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and creates a label (carrier pickup is tracked separately).`);
+    if (!rate.purchasable) { setError("This rate cannot be purchased here."); return; }
+    const confirmed = window.confirm(rate.test ? "Create a Shippo test label for this order?" : `Purchase a REAL shipping label for order ${selectedOrder.orderNumber || orderId}?\n${rate.carrier} — ${rate.service}\nTOTAL: ${rate.amount} ${rate.currency}\n\nThis charges your Shippo account and creates a label (carrier pickup is tracked separately).`);
     if (!confirmed) return;
     setPurchasing(true); setError("");
     try {
@@ -187,7 +187,7 @@ export default function AdminShippoRates({ api, orderId = null }) {
             <td style={{ padding: "18px", fontWeight: 800, fontSize: 17, whiteSpace: "nowrap" }}>{Number(rate.amount).toFixed(2)} {rate.currency}</td>
             <td style={{ padding: "18px" }}>{rate.estimatedDeliveryStart && rate.estimatedDeliveryEnd ? <><strong>{formatDate(rate.estimatedDeliveryStart)} – {formatDate(rate.estimatedDeliveryEnd)}</strong><div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>Approx. {rate.estimatedDays} transit days + buffer</div></> : "Not provided"}</td>
             <td style={{ padding: "18px", borderRadius: "0 10px 10px 0" }}>{rate.test ? "Test" : "Live"}</td>
-            {orderId && <td style={{ padding: "18px" }}><button className="btn btnPrimary" type="button" disabled={purchasing || rate.test} onClick={() => purchaseLabel(rate)}>{purchasing ? "Processing..." : "Buy label"}</button></td>}
+            {orderId && <td style={{ padding: "18px" }}><button className="btn btnPrimary" type="button" disabled={purchasing || !rate.purchasable} onClick={() => purchaseLabel(rate)}>{purchasing ? "Processing..." : rate.test ? "Create test label" : "Buy label"}</button></td>}
           </tr>)}</tbody>
         </table>
       </div>

@@ -16,7 +16,7 @@ import crypto from "crypto";
 import { sendEmail, sendAdminZellePendingEmail } from "./mailer.js";
 import { generateInvoicePDF } from "./invoicePdf.js";
 import Stripe from "stripe";
-import stripeRoutes from "./routes/stripe.js";
+import createStripeRouter from "./routes/stripe.js";
 import { requestFullStripeRefund } from "./services/stripeCancellationRefund.js";
 import createQuotesRouter from "./routes/quotes.js";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -294,15 +294,23 @@ const fullProducts = await Promise.all(
     );
   })
 );
-  const cleanItems = li.map((x, idx) => {
+  const serverPriced = meta.checkoutPricing === "server-v1";
+  const fees = new Map();
+  const cleanItems = li.flatMap((x, idx) => {
   const name = String(x?.description || `Item ${idx + 1}`);
   const qty = Number(x?.quantity);
   const unitCents = Number(x?.price?.unit_amount || 0);
   const price = Number((unitCents / 100).toFixed(2));
 
-  const sku = String(
-    fullProducts[idx]?.metadata?.sku || ""
-  ).trim();
+  const productMetadata = fullProducts[idx]?.metadata;
+  if (serverPriced && productMetadata?.checkoutFee) {
+    const fee = productMetadata.checkoutFee;
+    if (!["Shipping", "Sales tax"].includes(fee) || fees.has(fee) || qty !== 1 ||
+        !Number.isSafeInteger(unitCents) || unitCents <= 0) throw new Error("Invalid checkout fee");
+    fees.set(fee, unitCents);
+    return [];
+  }
+  const sku = String(productMetadata?.sku || "").trim();
 
   if (!sku) {
     throw new Error(`Missing SKU for ${name}`);
@@ -312,7 +320,7 @@ const fullProducts = await Promise.all(
     throw new Error(`Invalid quantity for SKU ${sku}`);
   }
 
-  return {
+  return [{
     id: `stripe_${idx + 1}`,
     name,
     sku,
@@ -321,7 +329,7 @@ const fullProducts = await Promise.all(
     price,
     qty,
     weightLb: 1,
-  };
+  }];
 });
 
   // 3) Totales y shipping usando tu misma lógica
@@ -338,13 +346,19 @@ const fullProducts = await Promise.all(
     return res.json({ received: true });
   }
 
-  const shippingNum = Math.max(0, Number(chosen.amount || 0));
-  const taxNum = calcTax(subtotal, customer);
+  const shippingNum = serverPriced ? (fees.get("Shipping") || 0) / 100 : Math.max(0, Number(chosen.amount || 0));
+  const taxNum = serverPriced ? (fees.get("Sales tax") || 0) / 100 : calcTax(subtotal, customer);
   const discounts = 0;
   const grandTotal = Number((subtotal + taxNum + shippingNum - discounts).toFixed(2));
 
+  if (serverPriced && (!cleanItems.length || session.currency !== "usd" ||
+      session.amount_total !== Math.round(grandTotal * 100))) {
+    throw new Error("Stripe Checkout total mismatch");
+  }
+
   // 4) Crear orden PAID/Card
       const saveWebhookOrder = db.transaction(() => {
+  if (db.prepare("SELECT id FROM orders WHERE stripeSessionId = ?").get(session.id)) return null;
   const orderId = uid("ord");
   const invoiceId = makeInvoiceId();
   const seq = nextOrderSeq();
@@ -374,7 +388,7 @@ const fullProducts = await Promise.all(
     "Card",
     "PAID",
     subtotal,
-    0,
+    taxNum,
     discounts,
     subtotal,
     taxNum,
@@ -403,6 +417,7 @@ session.id
 });
 
 const orderId = saveWebhookOrder();
+if (!orderId) return res.json({ received: true });
 const createdOrder = db.prepare("SELECT orderNumber, invoiceId FROM orders WHERE id = ?").get(orderId);
 console.log("✅ Order created:", createdOrder.orderNumber, createdOrder.invoiceId);
   console.log("🚀 Starting email block...");
@@ -490,7 +505,7 @@ await sendEmail({
 });
 
 app.use((req, res, next) => {
-  console.log("REQ:", req.method, req.url);
+  console.log("REQ:", req.method, req.path);
   next();
 });
 app.use("/uploads", express.static("uploads"));
@@ -498,7 +513,7 @@ app.use("/invoices", express.static("invoices")); // ✅ ESTA ES LA CLAVE
 app.use(cors()); // permite llamadas desde cualquier localhost (dev)
 app.use(express.json({ limit: "6mb" })); 
 app.use(express.urlencoded({ extended: true }));
-app.use(stripeRoutes);
+
 
 
 // =====================================================
@@ -1385,6 +1400,7 @@ try {
   oadd("confirmedAt", "TEXT", " DEFAULT ''");
   oadd("invoiceSentAt", "TEXT", " DEFAULT ''");
   oadd("invoiceSentTo", "TEXT", " DEFAULT ''");
+  oadd("zelleNotifiedAt", "TEXT");
 
   // ensure indexes exist
   db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_customerId ON orders(customerId);`);
@@ -2019,6 +2035,7 @@ app.get("/auth/me", authRequired, (req, res) => {
 // =====================================================
 // ADMIN: Customers list
 // =====================================================
+app.use(createStripeRouter({ stripe, db, authRequired, computeShippingOptionsAdvanced, calcTax }));
 app.use("/admin/shipping-boxes", createShippingBoxesRouter(db, authRequired));
 app.use("/admin/shippo", createShippoRatesRouter(db, authRequired));
 // Delivery timestamp is nullable until verified from the carrier; never infer it from purchase date.
@@ -2267,7 +2284,7 @@ app.get("/admin/orders/:id/label-cancellation-preview", authRequired, (req, res)
   // Never calculate a customer fee when a label's purchase amount or currency is uncertain.
   const cents = labels.map(label => {
     const amount = String(label.amount ?? "").trim();
-    if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
+    if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
         String(label.currency || "").toUpperCase() !== "USD" ||
         !label.shippoTransactionId) return null;
     const value = Math.round(Number(amount) * 100);
@@ -2312,8 +2329,9 @@ app.post("/admin/orders/:id/label-cancellation-review", authRequired, (req, res)
       let total = 0;
       for (const label of labels) {
         const amount = String(label.amount ?? "").trim();
-        if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
-            String(label.currency || "").toUpperCase() !== "USD" || !label.shippoTransactionId) {
+        if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
+            String(label.currency || "").toUpperCase() !== "USD" || !label.shippoTransactionId ||
+            label.shippoTransactionId.startsWith("pending-") || ["PURCHASING", "PURCHASE_REVIEW"].includes(label.refundStatus)) {
           return { error: "Unverified shipping label amount", code: 409 };
         }
         const cents = Math.round(Number(amount) * 100);
@@ -2653,7 +2671,7 @@ app.get("/admin/orders/:id/shippo-refund-reconciliation", authRequired, (req, re
     const details = [];
     for (const label of labels) {
       const amount = String(label.amount ?? "").trim();
-      if (!/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(amount) ||
+      if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(amount) ||
           String(label.currency || "").toUpperCase() !== "USD") {
         return res.status(409).json({ error: "Invalid label amount; manual review required" });
       }
@@ -2704,7 +2722,7 @@ app.post("/admin/orders/:id/shippo-refund-verification", authRequired, (req, res
       }
       const label = db.prepare("SELECT id, amount, currency FROM shipping_labels WHERE orderId = ? AND shippoTransactionId = ?").get(id, transactionId);
       if (!label || String(label.currency).toUpperCase() !== "USD" ||
-          !/^(?:0|[1-9]\\d*)(?:\\.\\d{1,2})?$/.test(String(label.amount))) {
+          !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(String(label.amount))) {
         return { error: "Label amount or currency invalid", code: 409 };
       }
       const labelCents = Math.round(Number(label.amount) * 100);
@@ -3946,18 +3964,8 @@ app.post("/orders", authRequired, (req, res) => {
 
     const pm2 = String(paymentMethod || "zelle").toLowerCase();
 
-    let paymentStatus =
-      pm2 === "zelle" ? "PENDING_ADMIN" : "PENDING";
-
-    // ✅ Stripe ya cobrado desde frontend
-    if (
-      pm2 === "card" &&
-      String(req.body?.paymentStatusOverride || "") === "PAID"
-    ) {
-      paymentStatus = "PAID";
-    }
-
-    const orderStatus = paymentStatus === "PAID" ? "PAID" : "PENDING";
+    const paymentStatus = pm2 === "zelle" ? "PENDING_ADMIN" : "PENDING";
+    const orderStatus = "PENDING";
 
     const orderId = uid("ord");
     const invoiceId = makeInvoiceId();

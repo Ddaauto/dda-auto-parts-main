@@ -8,7 +8,7 @@ const resend = !isPreview && process.env.RESEND_API_KEY ? new Resend(process.env
 const FROM_EMAIL = process.env.FROM_EMAIL || "no-reply@ddaautoparts.com";
 const FROM_NAME = process.env.FROM_NAME || "DDA Auto Parts";
 
-export async function sendEmail({ to, subject, html, text, attachments = [] }) {
+export async function sendEmail({ to, subject, html, text, attachments = [], idempotencyKey }) {
   if (isPreview) {
     console.log("[PREVIEW] Email delivery disabled:", subject);
     return { id: "preview-email-not-sent" };
@@ -25,7 +25,7 @@ export async function sendEmail({ to, subject, html, text, attachments = [] }) {
   if (attachments && attachments.length) {
     msg.attachments = attachments;
   }
-const { data, error } = await resend.emails.send(msg);
+const { data, error } = await resend.emails.send(msg, idempotencyKey ? { idempotencyKey } : undefined);
 
 if (error) {
   throw new Error(error.message || "Resend failed to send email");

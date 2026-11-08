@@ -7,13 +7,13 @@ import AdminShippoRates from "./AdminShippoRates";
 import AdminShippingLabelDetails from "./AdminShippingLabelDetails";
 import AdminShippingOrigin from "./AdminShippingOrigin";
 import AdminCancellationSettlement from "./AdminCancellationSettlement";
-const API_BASE = "https://dda-backend-ajr3.onrender.com";
+const API_BASE = import.meta.env.VITE_API_URL || "https://dda-backend-ajr3.onrender.com";
 // .env (frontend/.env)
 // VITE_ADMIN_USER=admin
 // VITE_ADMIN_PASS=1234
 const ADMIN_USER = import.meta.env.VITE_ADMIN_USER;
 const ADMIN_PASS = import.meta.env.VITE_ADMIN_PASS;
-const API = import.meta.env.VITE_API_URL;
+const API = API_BASE;
 
 const blankPick = { make: "", model: "", engine: "", yearStart: "", yearEnd: "" };
 const LOW_STOCK_THRESHOLD = 3;
