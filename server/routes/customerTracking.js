@@ -112,6 +112,12 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     const tracking = data?.tracking_status;
     if (typeof test !== "boolean" || typeof data?.transaction !== "string" ||
         !validStatus(tracking?.status) || !Number.isFinite(Date.parse(tracking?.status_date))) {
+      console.warn("Shippo webhook validation failed", {
+        testIsBoolean: typeof test === "boolean",
+        transactionIsString: typeof data?.transaction === "string",
+        trackingStatusValid: validStatus(tracking?.status),
+        statusDateValid: Number.isFinite(Date.parse(tracking?.status_date)),
+      });
       return res.sendStatus(400);
     }
     const label = db.prepare(`SELECT id, orderId FROM shipping_labels WHERE shippoTransactionId = ?
