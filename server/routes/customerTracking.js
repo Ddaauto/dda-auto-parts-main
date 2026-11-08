@@ -121,7 +121,12 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     }
     const number = String(data?.tracking_number || "").trim();
     const carrier = String(data?.carrier || "").trim();
-    if (!number || !carrier) return res.sendStatus(400);
+    if (!number || !carrier) {
+      console.warn("Shippo webhook missing tracking identity", {
+        trackingNumberPresent: Boolean(number), carrierPresent: Boolean(carrier), test,
+      });
+      return res.sendStatus(400);
+    }
     const transaction = typeof data?.transaction === "string" ? data.transaction.trim() : "";
     const labels = db.prepare(`SELECT id, orderId FROM shipping_labels
       WHERE trackingNumber = ? AND LOWER(carrier) = LOWER(?) AND testMode = ?
@@ -133,6 +138,7 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     }
     const label = labels[0];
     if (label) applyTracking(label.orderId, label.id, tracking.status, tracking.status_date, test);
+    console.log("Shippo tracking webhook accepted", { labelMatched: Boolean(label), test });
     res.sendStatus(204);
     void deliverNotifications().catch(console.error);
   });
