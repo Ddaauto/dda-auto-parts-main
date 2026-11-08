@@ -110,19 +110,28 @@ export default function createCustomerTrackingRouter(db, authRequired) {
     const { event, data, test } = req.body || {};
     if (event !== "track_updated") return res.sendStatus(204);
     const tracking = data?.tracking_status;
-    if (typeof test !== "boolean" || typeof data?.transaction !== "string" ||
-        !validStatus(tracking?.status) || !Number.isFinite(Date.parse(tracking?.status_date))) {
+    if (typeof test !== "boolean" || !validStatus(tracking?.status) ||
+        !Number.isFinite(Date.parse(tracking?.status_date))) {
       console.warn("Shippo webhook validation failed", {
         testIsBoolean: typeof test === "boolean",
-        transactionIsString: typeof data?.transaction === "string",
         trackingStatusValid: validStatus(tracking?.status),
         statusDateValid: Number.isFinite(Date.parse(tracking?.status_date)),
       });
       return res.sendStatus(400);
     }
-    const label = db.prepare(`SELECT id, orderId FROM shipping_labels WHERE shippoTransactionId = ?
-      AND trackingNumber = ? AND LOWER(carrier) = LOWER(?) AND testMode = ?`)
-      .get(data.transaction, String(data.tracking_number || ""), String(data.carrier || ""), Number(test));
+    const number = String(data?.tracking_number || "").trim();
+    const carrier = String(data?.carrier || "").trim();
+    if (!number || !carrier) return res.sendStatus(400);
+    const transaction = typeof data?.transaction === "string" ? data.transaction.trim() : "";
+    const labels = db.prepare(`SELECT id, orderId FROM shipping_labels
+      WHERE trackingNumber = ? AND LOWER(carrier) = LOWER(?) AND testMode = ?
+      AND (? = '' OR shippoTransactionId = ?) LIMIT 2`)
+      .all(number, carrier, Number(test), transaction, transaction);
+    if (labels.length > 1) {
+      console.warn("Shippo tracking matches multiple labels; manual review required");
+      return res.sendStatus(409);
+    }
+    const label = labels[0];
     if (label) applyTracking(label.orderId, label.id, tracking.status, tracking.status_date, test);
     res.sendStatus(204);
     void deliverNotifications().catch(console.error);

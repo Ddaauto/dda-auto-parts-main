@@ -162,7 +162,11 @@ test("isolated Shippo, tracking, payment, cancellation and inventory integration
   await webhook(labels[0], "TRANSIT", "02", 401, "invalid");
   await webhook(labels[0], "TRANSIT", "02", 204, "fixture-token", false);
   assert.equal((await call("GET", trackingPath, 200, undefined, customer)).pickedUpCount, 0);
-  await webhook(labels[0], "TRANSIT", "02");
+  await call("POST", "/shipping/shippo/webhook?token=fixture-token", 204, {
+    event: "track_updated", test: true,
+    data: { carrier: "usps", tracking_number: "track-" + labels[0],
+      tracking_status: { status: "TRANSIT", status_date: "2026-11-02T12:00:00Z" } },
+  }, null);
   assert.equal((await call("GET", trackingPath, 200, undefined, customer)).shippingStatus, "PARTIALLY_SHIPPED");
   assert.equal(order(shipped).status, "LABEL_CREATED");
   await call("PUT", `/admin/orders/${shipped}/cancel`, 409);
