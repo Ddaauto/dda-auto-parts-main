@@ -9,6 +9,10 @@ export default function createShippingOriginRouter(db, authRequired) {
     country TEXT NOT NULL DEFAULT 'US', phone TEXT NOT NULL DEFAULT '',
     updatedAt TEXT NOT NULL
   )`);
+  const columns = db.prepare("PRAGMA table_info(shipping_origin)").all();
+  if (!columns.some(column => column.name === "email")) {
+    db.exec("ALTER TABLE shipping_origin ADD COLUMN email TEXT NOT NULL DEFAULT ''");
+  }
   db.prepare(`INSERT OR IGNORE INTO shipping_origin
     (id, name, street1, street2, city, state, zip, country, phone, updatedAt)
     VALUES (1, 'DDA Auto Parts', '11115 W Okeechobee Rd', 'Unit 170',
@@ -23,8 +27,11 @@ export default function createShippingOriginRouter(db, authRequired) {
     origin: db.prepare("SELECT * FROM shipping_origin WHERE id = 1").get(),
   }));
   router.put("/", (req, res) => {
-    const fields = ["name", "street1", "street2", "city", "state", "zip", "phone"];
+    const fields = ["name", "street1", "street2", "city", "state", "zip", "phone", "email"];
     const origin = Object.fromEntries(fields.map(k => [k, String(req.body?.[k] ?? "").trim()]));
+    if (req.body?.email === undefined) {
+      origin.email = db.prepare("SELECT email FROM shipping_origin WHERE id = 1").get()?.email || "";
+    }
     if (["name", "street1", "city", "state", "zip"].some(k => !origin[k]))
       return res.status(400).json({ error: "Name, street, city, state and ZIP are required" });
     if (!/^\d{5}(?:-\d{4})?$/.test(origin.zip) || !/^[A-Za-z]{2}$/.test(origin.state))
@@ -32,7 +39,7 @@ export default function createShippingOriginRouter(db, authRequired) {
     if (fields.some(k => origin[k].length > 150))
       return res.status(400).json({ error: "Field too long" });
     db.prepare(`UPDATE shipping_origin SET name=@name, street1=@street1,
-      street2=@street2, city=@city, state=@state, zip=@zip, phone=@phone,
+      street2=@street2, city=@city, state=@state, zip=@zip, phone=@phone, email=@email,
       updatedAt=@updatedAt WHERE id=1`).run({ ...origin, state: origin.state.toUpperCase(),
       updatedAt: new Date().toISOString() });
     res.json({ origin: db.prepare("SELECT * FROM shipping_origin WHERE id = 1").get() });

@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 const fields = [
   ["name", "Sender name"], ["street1", "Street address"],
   ["street2", "Suite / unit"], ["city", "City"], ["state", "State"],
-  ["zip", "ZIP"], ["phone", "Contact phone (optional)"],
+  ["zip", "ZIP"], ["phone", "Contact phone"], ["email", "Contact email"],
 ];
 export default function AdminShippingOrigin({ api }) {
   const [origin, setOrigin] = useState(null);
@@ -41,7 +41,7 @@ export default function AdminShippingOrigin({ api }) {
       {fields.map(([field, label]) => <label key={field} style={{ display: "block", marginBottom: 12 }}>
         {label}<input style={{ display: "block", width: "100%", maxWidth: 420 }}
           value={origin[field] || ""} onChange={e => setOrigin({ ...origin, [field]: e.target.value })}
-          required={!["street2", "phone"].includes(field)} />
+          required={!["street2", "phone", "email"].includes(field)} />
       </label>)}
       <button className="btn" disabled={saving}>{saving ? "Saving..." : "Save shipping origin"}</button>
     </form>}

@@ -60,10 +60,16 @@ test("isolated Shippo, tracking, payment, cancellation and inventory integration
     globalThis.fetch = async (url, options) => {
       if (String(url).startsWith("http://127.0.0.1:")) return fetchLocal(url, options);
       if (options?.headers?.Authorization !== "ShippoToken shippo_test_fixture") throw Error("Unexpected outbound request");
-      if (url === "https://api.goshippo.com/shipments/") return Response.json({
+      if (url === "https://api.goshippo.com/shipments/") {
+        const shipment = JSON.parse(options.body);
+        if (shipment.address_from.phone !== "3055550100" || shipment.address_from.email !== "sender@example.invalid") {
+          throw Error("Sender contact missing from shipment");
+        }
+        return Response.json({
         rates: [{ object_id: "rate" + ++rates, provider: "USPS", servicelevel: { name: "Priority" },
           amount: "6.00", currency: "USD", test: true }]
-      });
+        });
+      }
       if (url === "https://api.goshippo.com/transactions/") {
         const { rate } = JSON.parse(options.body);
         return Response.json({ status: "SUCCESS", object_id: "txn-" + rate,
@@ -126,6 +132,10 @@ test("isolated Shippo, tracking, payment, cancellation and inventory integration
   const createZelle = async () => (await call("POST", "/orders", 200, { items, selectedShippingId: "free_delivery" }, customer)).id;
 
   assert.ok((await call("GET", "/admin/shipping-boxes", 200)).boxes.length);
+  await call("PUT", "/admin/shipping-origin", 200, {
+    name: "Sandbox sender", street1: "1 Main St", city: "Hialeah", state: "FL",
+    zip: "33010", phone: "3055550100", email: "sender@example.invalid",
+  });
   await call("GET", "/admin/shipping-boxes", 403, undefined, customer);
   const shipped = await createZelle();
   assert.equal(order(shipped).paymentStatus, "PENDING_ADMIN");

@@ -103,6 +103,7 @@ export default function createShippoRatesRouter(db, authRequired) {
       customer: {
         name: [customer.firstName, customer.lastName].filter(Boolean).join(" "),
         email: customer.email || "",
+        phone: customer.phone || "",
         street1: customer.street || customer.address || "",
         city: customer.city || "", state: customer.state || "", zip: customer.zip || "",
       },
@@ -160,9 +161,12 @@ export default function createShippoRatesRouter(db, authRequired) {
       state: String(a.state).slice(0, 40),
       zip: String(a.zip).slice(0, 10),
       country: "US",
+      ...(a.phone ? { phone: String(a.phone).slice(0, 40) } : {}),
+      ...(a.email ? { email: String(a.email).slice(0, 254) } : {}),
     });
     const payload = {
-      address_from: address({ ...origin, zip: originZip }),
+      address_from: address({ ...origin, zip: originZip,
+        email: origin?.email || process.env.ADMIN_NOTIFY_EMAIL || "" }),
       address_to: address(destination),
       parcels: [{
         length: String(Number(box.lengthIn)), width: String(Number(box.widthIn)),
