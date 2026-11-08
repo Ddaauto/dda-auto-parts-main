@@ -67,7 +67,14 @@ export default function createShippoRatesRouter(db, authRequired) {
       if (["PURCHASING","PURCHASE_REVIEW"].includes(label.refundStatus)) return { error: "Previous purchase requires manual review" };
       let parts; try { parts = JSON.parse(label.packageItemsJson || "[]"); } catch { return { error: "Existing package allocation needs review" }; }
       if (!parts.length) return { error: "Existing label lacks package allocation; manual review required" };
-      for (const part of parts) allocated.set(part.key, (allocated.get(part.key) || 0) + Number(part.qty));
+      for (const part of parts) {
+        const key = String(part.key || "");
+        const qty = Number(part.qty);
+        if (!totals.has(key) || !Number.isSafeInteger(qty) || qty < 1) return { error: "Existing package allocation needs review" };
+        const next = (allocated.get(key) || 0) + qty;
+        if (next > totals.get(key)) return { error: "Existing package quantities exceed the order; manual review required" };
+        allocated.set(key, next);
+      }
     }
     for (const [key, qty] of selected) {
       if (qty + (allocated.get(key) || 0) > totals.get(key)) return { error: "Package quantity exceeds unshipped quantity" };
@@ -231,7 +238,10 @@ export default function createShippoRatesRouter(db, authRequired) {
     if (existingLabels.length && req.body?.multiPackage !== true)
       return res.status(409).json({ error: "Explicit multi-package confirmation required" });
     const currentOrder = orderSnapshot(orderId);
-    const allocation = packageAllocation(currentOrder, JSON.parse(quote.packageItemsJson || "[]"), existingLabels.length > 0 || req.body?.multiPackage === true);
+    let quotedItems;
+    try { quotedItems = JSON.parse(quote.packageItemsJson || "[]"); }
+    catch { return res.status(409).json({ error: "Stored package allocation is invalid; request a new rate" }); }
+    const allocation = packageAllocation(currentOrder, quotedItems, existingLabels.length > 0 || req.body?.multiPackage === true);
     if (allocation.error) return res.status(409).json({ error: allocation.error });
     const token = process.env.SHIPPO_API_TOKEN;
     if (!token) return res.status(503).json({ error: "Shippo is not configured" });
