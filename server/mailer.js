@@ -3,20 +3,21 @@ import { Resend } from "resend";
 import "dotenv/config";
 
 const isPreview = process.env.NODE_ENV === "test";
-const resend = !isPreview && process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const previewRecipient = isPreview ? String(process.env.SANDBOX_EMAIL_RECIPIENT || "").trim() : "";
+const resend = (!isPreview || previewRecipient) && process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const FROM_EMAIL = process.env.FROM_EMAIL || "no-reply@ddaautoparts.com";
 const FROM_NAME = process.env.FROM_NAME || "DDA Auto Parts";
 
 export async function sendEmail({ to, subject, html, text, attachments = [], idempotencyKey }) {
-  if (isPreview) {
+  if (isPreview && !previewRecipient) {
     console.log("[PREVIEW] Email delivery disabled:", subject);
     return { id: "preview-email-not-sent" };
   }
   if (!resend) throw new Error("RESEND_API_KEY is required for email delivery");
   const msg = {
     from: `${FROM_NAME} <${FROM_EMAIL}>`,
-    to,
+    to: previewRecipient || to,
     subject,
     html: html || `<p>${text}</p>`,
     text,
